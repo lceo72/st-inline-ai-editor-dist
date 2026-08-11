@@ -3291,9 +3291,13 @@
         const controller = new hostWindow.AbortController();
         const timer = hostWindow.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
         try {
-            // ?t= on top of no-store because the CDN in front of raw.githubusercontent
-            // caches for several minutes; without it "檢查更新" right after a release
-            // would keep reporting the old version.
+            // ⚠️ Measured 2026-08-11: raw.githubusercontent answers `cache-control:
+            // max-age=300` from a Fastly edge that ignores BOTH a `?t=` query string and a
+            // `Cache-Control: no-cache` request header. So neither of these actually
+            // defeats it — for up to five minutes after a release, a check can still
+            // report the previous version. They are kept because they do work on ordinary
+            // intermediate caches (corporate proxies, service workers); do not write a
+            // comment claiming they beat GitHub's CDN, because they do not.
             const response = await hostWindow.fetch(`${UPDATE_SOURCE_URL}?t=${Date.now()}`, { cache: 'no-store', signal: controller.signal });
             // 404 has one overwhelmingly likely cause and it is not "the file moved":
             // raw.githubusercontent serves nothing at all for a private repository, so a
