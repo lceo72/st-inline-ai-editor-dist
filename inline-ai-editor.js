@@ -1,0 +1,4221 @@
+/**
+ * SillyTavern Inline AI Editor
+ * TavernHelper / JS-Slash-Runner global script.
+ *
+ * Requirements:
+ * - SillyTavern 1.18.0+
+ * - TavernHelper (formerly JS-Slash-Runner)
+ * - SillyTavern Connection Manager enabled
+ */
+/**
+ * 檔案地圖 — grep 「══════」可以逐一跳到下列區塊。
+ *
+ *   ══════ 常數與輸出協定 ══════
+ *   ══════ 純函式：設定與客製指令 ══════
+ *   ══════ 純函式：解析模型輸出 ══════
+ *   ══════ 純函式：差異比對與逐行取捨 ══════
+ *   ══════ 純函式：參考樓層範圍 ══════
+ *   ══════ 純函式：正則規則 ══════
+ *   ══════ 純函式：世界書條目 ══════
+ *   ══════ 純函式：組裝提示詞 ══════
+ *   ══════ 純函式：更新檢查 ══════
+ *   ══════ 測試出口（之前不得有 await） ══════
+ *   ══════ 宿主繫結、狀態與共用小工具 ══════
+ *   ══════ 樣式表 ══════
+ *   ══════ 宿主 API 包裝：樓層、正則、世界書 ══════
+ *   ══════ 編輯器介面：魔杖、視窗、參考資料 ══════
+ *   ══════ 編輯器行為：開啟、儲存、關閉 ══════
+ *   ══════ 差異視窗與審核流程 ══════
+ *   ══════ 更新：檢查與寫回腳本庫 ══════
+ *   ══════ 表單與設定視窗 ══════
+ *   ══════ 生命週期：事件、清理、啟動 ══════
+ *
+ * 上半部（到「測試出口」為止）是純函式，可以在 Node 裡直接載入測試；
+ * 之後才會解析 hostWindow / tavern，而且那之前不能出現任何 await。
+ * 細節與各種「改了不會報錯」的地雷見 CLAUDE.md。
+ */
+(async function bootstrapInlineAiEditor(globalScope) {
+    'use strict';
+
+    // ══════ 常數與輸出協定 ══════
+
+    const VERSION = '0.7.0';
+    const SETTINGS_KEY = 'st_inline_ai_editor';
+    const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
+    const STYLE_ID = 'stiae-styles';
+    const ROOT_CLASS = 'stiae-root';
+
+    const DEFAULT_GLOBAL_PROMPT = 'Preserve the source\'s Markdown structure, character voice, narrative POV, and established facts.';
+
+    // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
+    // whose value is "run this in my browser" — the whole safety of this feature rests on
+    // the address being one the user cannot be talked into changing.
+    //
+    // The residual risk that cannot be engineered away: whoever controls that repository
+    // can ship code into anyone who presses 更新. There is no signature to check, because
+    // checking one would need a server this project does not have. Said plainly in
+    // README so the choice is the user's.
+    // ⚠️ This is the PUBLIC dist repo, not the development one. The development repo is
+    // private, and raw.githubusercontent serves 404 for a private repository to everyone
+    // — including the owner's own browser, which has no GitHub session to offer. Pointing
+    // this at the private repo makes every check fail with 404 and no update ever works.
+    // Releases get there via `node tools/publish-dist.cjs <資料夾>`.
+    const UPDATE_SOURCE_URL = 'https://raw.githubusercontent.com/lceo72/st-inline-ai-editor-dist/main/inline-ai-editor.js';
+    const UPDATE_HOME_URL = 'https://github.com/lceo72/st-inline-ai-editor-dist';
+    const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    // The script has never been anywhere near this small. A truncated response, a captive
+    // portal's login page or an error page dressed as 200 all land far below it.
+    const UPDATE_MIN_LENGTH = 60000;
+
+    const ICONS = [
+        ['fa-wand-magic-sparkles', '魔杖'],
+        ['fa-pen', '筆'],
+        ['fa-spell-check', '校對'],
+        ['fa-scissors', '縮短'],
+        ['fa-up-right-and-down-left-from-center', '擴寫'],
+        ['fa-feather', '文風'],
+        ['fa-language', '語言'],
+        ['fa-list-check', '檢查'],
+        ['fa-comment-dots', '對話'],
+        ['fa-book-open', '敘事'],
+    ];
+
+    const BUILTIN_ACTIONS = [
+        {
+            id: 'rewrite',
+            name: '重寫',
+            icon: 'fa-pen',
+            mode: 'replacement',
+            instruction: 'Rewrite the scope. Keep the meaning, the character voice, the narrative POV, and roughly the same length; improve the phrasing and the readability.',
+        },
+        {
+            id: 'shorten',
+            name: '縮短',
+            icon: 'fa-scissors',
+            mode: 'replacement',
+            instruction: 'Shorten the scope. Cut repetition and padding; keep the information, the voice, and every plot fact.',
+        },
+        {
+            id: 'expand',
+            name: '擴寫',
+            icon: 'fa-up-right-and-down-left-from-center',
+            mode: 'replacement',
+            instruction: 'Expand the scope with sensory detail, action, or beats. Every addition follows from what the passage already establishes, and every character keeps the intent they already had.',
+        },
+        {
+            id: 'polish',
+            name: '潤飾',
+            icon: 'fa-spell-check',
+            mode: 'patch',
+            instruction: 'Correct grammar, punctuation, word choice, and flow. Change only what is wrong and leave sound passages as they stand.',
+        },
+    ];
+
+    const LOCKED_PROTOCOL = {
+        patch: [
+            'Return only search-and-replace pairs, in this exact form:',
+            '<search>text taken from the editable scope</search><replace>replacement text</replace>',
+            'Copy the search text character for character, including whitespace and punctuation exactly as it appears; do not normalize or convert anything. Carry enough surrounding text to single out one occurrence.',
+            'Quotation marks often open and close far apart, so a search may carry only one half of a pair. Copy the halves the scope actually has at that spot. A search that does not appear verbatim is dropped.',
+            'Return an empty <replace></replace> to delete the searched text.',
+            'Emit one pair per independent change, and no pairs at all when the scope already reads well. Every search comes from the editable scope.',
+        ].join('\n'),
+        replacement: [
+            'Return only the rewritten scope, in this exact form:',
+            '<replacement>the complete replacement text</replacement>',
+            'The replacement stands in for the entire editable scope, and for nothing outside it.',
+        ].join('\n'),
+    };
+
+    // Block markers use full-width brackets so a message that happens to contain the
+    // half-width spelling cannot be mistaken for a real boundary. This is deliberately
+    // the opposite of rewriting the user's own text: the editable scope travels back
+    // here to be matched character for character and then written into the chat, so
+    // altering it would make every patch miss, or write full-width brackets into the
+    // user's prose. We change our markers; we never change their words.
+    //
+    // <search> / <replace> stay half-width on purpose. The model has to emit those
+    // itself, and the half-width spelling is the form it has seen countless times.
+    // The parser's correctness rests entirely on them.
+    const MARK = {
+        referenceOpen: '＜＜＜REFERENCE_MATERIAL＞＞＞',
+        referenceClose: '＜＜＜END_REFERENCE_MATERIAL＞＞＞',
+        targetOpen: '＜＜＜TARGET_MESSAGE_FULL＞＞＞',
+        targetClose: '＜＜＜END_TARGET_MESSAGE_FULL＞＞＞',
+        scopeOpen: '＜＜＜EDITABLE_SCOPE＞＞＞',
+        scopeClose: '＜＜＜END_EDITABLE_SCOPE＞＞＞',
+        fullScopeOpen: '＜＜＜EDITABLE_SCOPE_IS_FULL_MESSAGE＞＞＞',
+        fullScopeClose: '＜＜＜END_EDITABLE_SCOPE_IS_FULL_MESSAGE＞＞＞',
+    };
+
+    // How the reference material introduces itself. Deliberately "background, for
+    // understanding only" rather than "earlier prose of this same story".
+    //
+    // ⚠️ Known side effect, chosen with the tradeoff understood: the model is less
+    // likely to carry over the tone of the referenced passages. If a flashback comes
+    // back reading like it belongs to a different book, this constant is the first
+    // knob to turn — try wording it as the story's own earlier prose.
+    const REFERENCE_IDENTITY = [
+        'The excerpts below are background information, provided only so that you can',
+        'understand the story. They are read-only: never edit them, never reproduce them,',
+        'and never take search text from them.',
+    ].join('\n');
+
+    // Said twice on purpose — once here in the protocol and once beside the data. The
+    // model taking its search text out of the reference material is a mistake other
+    // projects only documented after being bitten by it, and a repeated sentence is
+    // far cheaper than a screen full of patches that match nothing.
+    const PATCH_REFERENCE_RULE = 'Reference material is not part of the editable scope. Every search must come from the editable scope alone.';
+
+    // ══════ 純函式：設定與客製指令 ══════
+
+    function clone(value) {
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function makeId(prefix = 'cmd') {
+        const random = globalScope.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        return `${prefix}-${random}`;
+    }
+
+    function normalizeCommand(command, index) {
+        return {
+            id: String(command?.id || makeId()),
+            name: String(command?.name || `指令 ${index + 1}`),
+            // Empty means ungrouped, which is what every command from before 0.7.0 is.
+            // Only custom commands carry this — builtins keep their own identity and are
+            // never mixed into the custom list (ADR-0001).
+            group: String(command?.group || '').trim(),
+            icon: ICONS.some(([value]) => value === command?.icon) ? command.icon : ICONS[0][0],
+            instruction: String(command?.instruction || ''),
+            mode: command?.mode === 'replacement' ? 'replacement' : 'patch',
+            systemPrompt: String(command?.systemPrompt || ''),
+            profileId: String(command?.profileId || ''),
+            profileName: String(command?.profileName || ''),
+            maxTokens: Number.isFinite(Number(command?.maxTokens)) && Number(command.maxTokens) > 0
+                ? Math.round(Number(command.maxTokens))
+                : null,
+            visible: command?.visible !== false,
+        };
+    }
+
+    // Groups are a view of the stored order, not a second ordering to keep in step with
+    // it. Commands of the same group are gathered together and the groups themselves run
+    // in the order they first appear, so the settings list, the ⋯ menu and the up/down
+    // buttons can never disagree about what comes after what.
+    //
+    // The sort must stay stable: within a group the author's own order is the answer, and
+    // this runs on every normalizeSettings() — an unstable sort would shuffle the list on
+    // its own every time it was saved.
+    function sortCommandsByGroup(commands) {
+        const seen = [];
+        for (const command of commands) {
+            const group = command?.group || '';
+            if (!seen.includes(group)) seen.push(group);
+        }
+        return commands.slice().sort((a, b) => seen.indexOf(a?.group || '') - seen.indexOf(b?.group || ''));
+    }
+
+    function commandGroupNames(commands) {
+        const names = [];
+        for (const command of commands || []) {
+            const group = command?.group || '';
+            if (group && !names.includes(group)) names.push(group);
+        }
+        return names;
+    }
+
+    // A builtin command the user has edited is stored as a complete frozen copy, keyed
+    // by the preset id (ADR-0001). Anything that is not a known preset id is dropped,
+    // and the id is always taken from the preset rather than from stored data: a corrupt
+    // or hand-edited payload must not be able to invent a fifth builtin or rename one
+    // into an orphan the settings dialog can no longer reach.
+    function normalizeBuiltinOverrides(raw) {
+        const source = raw && typeof raw === 'object' ? raw : {};
+        const overrides = {};
+        BUILTIN_ACTIONS.forEach((preset, index) => {
+            const entry = source[preset.id];
+            if (!entry || typeof entry !== 'object') return;
+            overrides[preset.id] = { ...normalizeCommand({ ...preset, ...entry }, index), id: preset.id };
+        });
+        return overrides;
+    }
+
+    // Number(null) is 0 and Number('') is 0, both of which are finite. Feeding a
+    // stored `null` straight into Number.isFinite therefore turns "no saved position"
+    // into "position 0", which is why this cannot be inlined as a bare Number check:
+    // settings get normalized on every save, so the second pass would pin the editor
+    // to the top-left corner for good.
+    function finiteOr(value, fallback) {
+        if (value === null || value === undefined || value === '') return fallback;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : fallback;
+    }
+
+    function normalizeSettings(raw) {
+        const settings = raw && typeof raw === 'object' ? raw : {};
+        const rect = settings.editorRect && typeof settings.editorRect === 'object' ? settings.editorRect : {};
+        return {
+            version: VERSION,
+            defaultProfileId: String(settings.defaultProfileId || ''),
+            defaultProfileName: String(settings.defaultProfileName || ''),
+            globalPrompt: String(settings.globalPrompt || DEFAULT_GLOBAL_PROMPT),
+            defaultMaxTokens: Number.isFinite(Number(settings.defaultMaxTokens)) && Number(settings.defaultMaxTokens) > 0
+                ? Math.round(Number(settings.defaultMaxTokens))
+                : 2048,
+            lastCustomMode: settings.lastCustomMode === 'replacement' ? 'replacement' : 'patch',
+            // Update checking. On by default, and switchable off: a tool that reaches the
+            // network by itself has to be stoppable without editing anything. The other
+            // two remember the last check so reloading SillyTavern does not mean asking
+            // GitHub again, and so the notice survives that reload.
+            updateCheckEnabled: settings.updateCheckEnabled !== false,
+            updateCheckedAt: finiteOr(settings.updateCheckedAt, 0),
+            updateLatestVersion: String(settings.updateLatestVersion || ''),
+            // Which of the user's SillyTavern regex rules run over reference material.
+            // Persistent by design: this answers "which of my rules make sense while
+            // editing", a judgement that does not change from one session to the next.
+            regexRuleIds: Array.isArray(settings.regexRuleIds)
+                ? [...new Set(settings.regexRuleIds.map(String).filter(Boolean))]
+                : [],
+            // Ticked world info entries survive the editor closing. This reverses the
+            // 0.5.0-development decision to make them session-scoped: in real use the
+            // same background is wanted over and over, and re-ticking it every time was
+            // the single biggest complaint. A book+uid pair still means the same entry
+            // in another chat, which is what makes carrying it over safe.
+            worldbookSelection: Array.isArray(settings.worldbookSelection)
+                ? dedupeWorldbookRefs(settings.worldbookSelection.map(normalizeWorldbookRef).filter(Boolean))
+                : [],
+            // Reference floors are remembered too, but ONLY for the chat they were typed
+            // in — a floor number means nothing outside its own chat, and floor 42 in
+            // another chat is a completely different scene that the tool cannot tell
+            // apart. The id is stored beside the text so a mismatch simply restores
+            // nothing.
+            referenceInput: String(settings.referenceInput || ''),
+            referenceChatId: String(settings.referenceChatId || ''),
+            builtinOverrides: normalizeBuiltinOverrides(settings.builtinOverrides),
+            commands: Array.isArray(settings.commands) ? sortCommandsByGroup(settings.commands.map(normalizeCommand)) : [],
+            editorRect: {
+                width: finiteOr(rect.width, 980),
+                height: finiteOr(rect.height, 720),
+                left: finiteOr(rect.left, null),
+                top: finiteOr(rect.top, null),
+            },
+        };
+    }
+
+    // The toolbar and the settings dialog must never disagree about what a command
+    // actually is. Both read the builtin list from here, so the override merge that
+    // 0.3.0 adds lives in one place instead of being repeated at each call site.
+    function resolveCommands(settings) {
+        const overrides = settings?.builtinOverrides && typeof settings.builtinOverrides === 'object'
+            ? settings.builtinOverrides
+            : {};
+        const builtins = BUILTIN_ACTIONS.map((preset, index) => {
+            const override = overrides[preset.id];
+            const stored = override && typeof override === 'object' ? override : null;
+            return {
+                ...normalizeCommand({ ...preset, ...stored }, index),
+                id: preset.id,
+                builtin: true,
+                modified: Boolean(stored),
+            };
+        });
+        const source = Array.isArray(settings?.commands) ? settings.commands : [];
+        const customs = source.map((command, index) => ({
+            ...normalizeCommand(command, index),
+            builtin: false,
+        }));
+        return { builtins, customs };
+    }
+
+    function createScriptVariableStore(scope, tavernObject) {
+        const boundGetVariables = typeof scope.getVariables === 'function' ? scope.getVariables.bind(scope) : null;
+        const boundReplaceVariables = typeof scope.replaceVariables === 'function' ? scope.replaceVariables.bind(scope) : null;
+        const getScriptId = typeof scope.getScriptId === 'function' ? scope.getScriptId.bind(scope) : null;
+
+        return {
+            read() {
+                if (boundGetVariables) return boundGetVariables({ type: 'script' }) || {};
+                const scriptId = getScriptId?.();
+                if (!scriptId) throw new Error('無法取得目前 TavernHelper 腳本 ID。');
+                return tavernObject.getVariables({ type: 'script', script_id: scriptId }) || {};
+            },
+            write(variables) {
+                if (boundReplaceVariables) {
+                    boundReplaceVariables(variables, { type: 'script' });
+                    return;
+                }
+                const scriptId = getScriptId?.();
+                if (!scriptId) throw new Error('無法取得目前 TavernHelper 腳本 ID。');
+                tavernObject.replaceVariables(variables, { type: 'script', script_id: scriptId });
+            },
+        };
+    }
+
+    // ══════ 純函式：解析模型輸出 ══════
+
+    function stripOuterCodeFence(text) {
+        const value = String(text ?? '').trim();
+        const match = value.match(/^```(?:\w+)?\s*\n?([\s\S]*?)\n?```$/);
+        return match ? match[1].trim() : value;
+    }
+
+    // Every import of the script gets a fresh runtime script_id, so settings never
+    // carry across an upgrade (see CLAUDE.md). The payload therefore has to survive
+    // being pasted into a different install: it names its own format and version so a
+    // later reader can tell a real backup from an arbitrary blob of JSON.
+    const SETTINGS_EXPORT_FORMAT = 'st-inline-ai-editor-settings';
+    const COMMANDS_EXPORT_FORMAT = 'st-inline-ai-editor-commands';
+
+    function serializeSettings(settings) {
+        return JSON.stringify({
+            format: SETTINGS_EXPORT_FORMAT,
+            version: VERSION,
+            settings: normalizeSettings(settings),
+        }, null, 2);
+    }
+
+    // Returns either { ok: true, settings, sourceVersion } or { ok: false, error }.
+    // A rejected payload must leave the caller with nothing to apply — half-importing
+    // a truncated backup is worse than refusing it.
+    function parseSettingsPayload(text) {
+        const raw = stripOuterCodeFence(text);
+        if (!raw) return { ok: false, error: '沒有貼上任何內容。' };
+        let payload;
+        try {
+            payload = JSON.parse(raw);
+        } catch {
+            return { ok: false, error: '這段文字不是有效的設定資料，無法解析。請確認整段都複製到了。' };
+        }
+        if (payload?.format === COMMANDS_EXPORT_FORMAT) {
+            return { ok: false, error: '這是「客製指令」的匯出檔，不是整包設定。請改用客製指令那一區的「貼上指令」。' };
+        }
+        if (!payload || typeof payload !== 'object' || payload.format !== SETTINGS_EXPORT_FORMAT) {
+            return { ok: false, error: '這不是 AI 內文編輯器的設定。請貼上「複製設定」產生的文字。' };
+        }
+        if (!payload.settings || typeof payload.settings !== 'object') {
+            return { ok: false, error: '設定資料缺少內容，可能複製時被截斷了。' };
+        }
+        return {
+            ok: true,
+            settings: normalizeSettings(payload.settings),
+            sourceVersion: String(payload.version || ''),
+        };
+    }
+
+    // Custom commands travel on their own so a set of them can be handed to someone else
+    // (or kept as a separate backup) without carrying the Connection Profile, the editing
+    // principles and every builtin override along with it.
+    //
+    // A distinct `format` from the whole-settings backup, so pasting one into the other's
+    // box is refused with a sentence that says which box it belongs in — rather than
+    // being read as a settings file with no settings in it and wiping everything.
+    function serializeCommands(commands) {
+        return JSON.stringify({
+            format: COMMANDS_EXPORT_FORMAT,
+            version: VERSION,
+            commands: sortCommandsByGroup((Array.isArray(commands) ? commands : []).map(normalizeCommand)),
+        }, null, 2);
+    }
+
+    // Returns { ok: true, commands, sourceVersion } or { ok: false, error }.
+    //
+    // ⚠️ Ids come out of here as they went in. The caller reissues them — importing is a
+    // merge (the user's own commands stay), and two commands sharing an id in one list is
+    // a state nothing else in the code expects.
+    function parseCommandsPayload(text) {
+        const raw = stripOuterCodeFence(text);
+        if (!raw) return { ok: false, error: '沒有貼上任何內容。' };
+        let payload;
+        try {
+            payload = JSON.parse(raw);
+        } catch {
+            return { ok: false, error: '這段文字不是有效的指令資料，無法解析。請確認整段都複製到了。' };
+        }
+        if (payload?.format === SETTINGS_EXPORT_FORMAT) {
+            return { ok: false, error: '這是整包設定的備份，不是客製指令。請改用「設定備份」那一區的「貼上設定」。' };
+        }
+        if (!payload || typeof payload !== 'object' || payload.format !== COMMANDS_EXPORT_FORMAT) {
+            return { ok: false, error: '這不是 AI 內文編輯器的客製指令。請貼上「複製指令」產生的文字。' };
+        }
+        if (!Array.isArray(payload.commands)) {
+            return { ok: false, error: '指令資料缺少內容，可能複製時被截斷了。' };
+        }
+        // An empty list parses fine but has nothing to merge, and silently reporting
+        // "imported 0" reads as success.
+        if (!payload.commands.length) {
+            return { ok: false, error: '這份匯出檔裡沒有任何客製指令。' };
+        }
+        return {
+            ok: true,
+            commands: payload.commands.map(normalizeCommand),
+            sourceVersion: String(payload.version || ''),
+        };
+    }
+
+    function parseSearchReplacePairs(response) {
+        const pairs = [];
+        const regex = /<search>([\s\S]*?)<\/search>\s*<replace>([\s\S]*?)<\/replace>/gi;
+        let match;
+        while ((match = regex.exec(String(response ?? ''))) !== null) {
+            if (!match[1].trim()) continue;
+            pairs.push({ search: match[1], replace: match[2] });
+        }
+        return pairs;
+    }
+
+    function applySearchReplacePairs(scopeText, pairs) {
+        let output = String(scopeText ?? '');
+        const applied = [];
+        const skipped = [];
+        for (const pair of pairs) {
+            // Match verbatim first: a model may include surrounding whitespace to
+            // pick out one of several identical passages. Trimming that away would
+            // silently rewrite the wrong one. Trim only as a fallback, and trim both
+            // sides together so the replacement stays aligned with what matched.
+            let search = pair.search;
+            let replace = pair.replace;
+            let index = output.indexOf(search);
+            if (index === -1) {
+                search = pair.search.trim();
+                replace = pair.replace.trim();
+                index = output.indexOf(search);
+            }
+            if (index === -1) {
+                skipped.push(pair);
+                continue;
+            }
+            output = `${output.slice(0, index)}${replace}${output.slice(index + search.length)}`;
+            applied.push(pair);
+        }
+        return { text: output, applied, skipped };
+    }
+
+    const SKIPPED_PREVIEW_LIMIT = 3;
+
+    function previewText(value) {
+        const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+        return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+    }
+
+    // `hasReference` arrives as an argument rather than being read from state: this
+    // function sits in the pure-function region that Node can load, and reaching for
+    // state here would break every test in the file.
+    function parseAiResponse(response, requestedMode, scopeText, hasReference = false) {
+        const raw = stripOuterCodeFence(response);
+        const warnings = [];
+
+        if (requestedMode === 'patch') {
+            const pairs = parseSearchReplacePairs(raw);
+            if (pairs.length) {
+                const searchTagCount = (raw.match(/<search>/gi) || []).length;
+                const replaceTagCount = (raw.match(/<replace>/gi) || []).length;
+                const malformedCount = Math.max(searchTagCount, replaceTagCount) - pairs.length;
+                const result = applySearchReplacePairs(scopeText, pairs);
+                if (malformedCount > 0) {
+                    warnings.push(`有 ${malformedCount} 項修補格式不完整，已跳過。`);
+                }
+                if (result.skipped.length) {
+                    warnings.push(`有 ${result.skipped.length} 項修補找不到原文，已跳過。`);
+                    // A free diagnostic lead rather than an up-front warning: there is
+                    // no evidence that reference material raises the miss rate, and a
+                    // permanent "this might fail" notice would just become noise. Once
+                    // something has actually missed, saying where to look is cheap.
+                    if (hasReference) {
+                        warnings.push('這次帶了參考資料，模型可能是從參考資料裡取原文。');
+                    }
+                    // Name the text that missed, so a near-miss (a quotation mark the
+                    // model balanced, a character it normalised) is visible instead of
+                    // hiding behind a count.
+                    for (const pair of result.skipped.slice(0, SKIPPED_PREVIEW_LIMIT)) {
+                        warnings.push(`找不到這段：${previewText(pair.search)}`);
+                    }
+                }
+                return {
+                    kind: 'patch',
+                    text: result.text,
+                    raw,
+                    appliedCount: result.applied.length,
+                    skippedCount: result.skipped.length,
+                    warnings,
+                };
+            }
+
+            warnings.push('模型未遵守局部修補格式，已改用全文替換預覽。');
+            return {
+                kind: 'fallback-replacement',
+                text: raw,
+                raw,
+                appliedCount: 0,
+                skippedCount: 0,
+                warnings,
+            };
+        }
+
+        const replacement = raw.match(/<replacement>([\s\S]*?)<\/replacement>/i);
+        if (replacement) {
+            return {
+                kind: 'replacement',
+                text: replacement[1].trim(),
+                raw,
+                appliedCount: 1,
+                skippedCount: 0,
+                warnings,
+            };
+        }
+
+        warnings.push('模型未使用 replacement 標籤，已把完整回覆當作替換內容。');
+        return {
+            kind: 'fallback-replacement',
+            text: raw,
+            raw,
+            appliedCount: 1,
+            skippedCount: 0,
+            warnings,
+        };
+    }
+
+    function applyScope(fullText, start, end, newScopeText) {
+        return `${fullText.slice(0, start)}${newScopeText}${fullText.slice(end)}`;
+    }
+
+    // ══════ 純函式：差異比對與逐行取捨 ══════
+
+    function tokenizeForDiff(value) {
+        return String(value ?? '').match(/(\s+|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[A-Za-z0-9_]+|[^\s])/gu) || [];
+    }
+
+    function lcsOps(a, b, equals, cellLimit = 350000) {
+        const n = a.length;
+        const m = b.length;
+        if (n * m > cellLimit) {
+            return [
+                ...a.map(value => ({ type: 'remove', value })),
+                ...b.map(value => ({ type: 'add', value })),
+            ];
+        }
+        const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+        for (let i = n - 1; i >= 0; i -= 1) {
+            for (let j = m - 1; j >= 0; j -= 1) {
+                dp[i][j] = equals(a[i], b[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+            }
+        }
+        const ops = [];
+        let i = 0;
+        let j = 0;
+        while (i < n && j < m) {
+            if (equals(a[i], b[j])) {
+                ops.push({ type: 'equal', value: a[i] });
+                i += 1;
+                j += 1;
+            } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+                ops.push({ type: 'remove', value: a[i++] });
+            } else {
+                ops.push({ type: 'add', value: b[j++] });
+            }
+        }
+        while (i < n) ops.push({ type: 'remove', value: a[i++] });
+        while (j < m) ops.push({ type: 'add', value: b[j++] });
+        return ops;
+    }
+
+    function pairLineOps(ops) {
+        const rows = [];
+        let index = 0;
+        while (index < ops.length) {
+            if (ops[index].type === 'equal') {
+                rows.push({ type: 'equal', original: ops[index].value, proposed: ops[index].value });
+                index += 1;
+                continue;
+            }
+            const removed = [];
+            const added = [];
+            while (index < ops.length && ops[index].type === 'remove') removed.push(ops[index++].value);
+            while (index < ops.length && ops[index].type === 'add') added.push(ops[index++].value);
+            const length = Math.max(removed.length, added.length);
+            for (let offset = 0; offset < length; offset += 1) {
+                rows.push({
+                    type: 'changed',
+                    original: removed[offset] ?? '',
+                    proposed: added[offset] ?? '',
+                    removeOnly: offset >= added.length,
+                    addOnly: offset >= removed.length,
+                });
+            }
+        }
+        return rows;
+    }
+
+    function computeDiffRows(original, proposed) {
+        const originalLines = String(original ?? '').split('\n');
+        const proposedLines = String(proposed ?? '').split('\n');
+        const ops = lcsOps(originalLines, proposedLines, (a, b) => a === b);
+        return pairLineOps(ops);
+    }
+
+    // Rebuilds the scope from a per-row decision: a ticked row contributes its
+    // proposed line, an unticked one its original.
+    //
+    // Selecting at this layer rather than at the patch layer is what makes partial
+    // acceptance safe. The patches run exactly once, before any of this, so nothing
+    // a user ticks can change whether a patch matched. Re-running applySearchReplacePairs
+    // per subset would not have that property: two patches whose search strings
+    // overlap in the source make one patch's fate depend on which others are in play,
+    // so dropping one could silently flip another between applied and skipped.
+    //
+    // A row with no original (a pure insertion) and a row with no proposed (a pure
+    // deletion) each contribute nothing on their rejected side rather than an empty
+    // string — otherwise declining an insertion would leave a blank line where
+    // nothing was ever inserted.
+    function composeSelectedRows(rows, selected = null) {
+        const out = [];
+        rows.forEach((row, index) => {
+            if (row.type === 'equal') {
+                out.push(row.original);
+                return;
+            }
+            if (!selected || selected[index] !== false) {
+                if (!row.removeOnly) out.push(row.proposed);
+            } else if (!row.addOnly) {
+                out.push(row.original);
+            }
+        });
+        return out.join('\n');
+    }
+
+    // ══════ 純函式：參考樓層範圍 ══════
+
+    const FLOOR_TOKEN = /^(\d+)(?:\s*-\s*(\d+))?$/;
+
+    // A runaway guard, not a product limit. It only bites when the chat length is
+    // unknown, because a known length already clamps every range.
+    const RANGE_EXPANSION_LIMIT = 2000;
+
+    // Turns "30, 42-46" into the floor ids to fetch. Everything the caller needs in
+    // order to *show* what happened comes back too: this project does not drop input
+    // quietly. The host is no help here — getChatMessages('30, 42-46') returns an
+    // empty array without throwing, and '0-9999' silently clamps to the whole chat,
+    // so both the splitting and the range checking have to happen right here.
+    function parseFloorRange(input, options = {}) {
+        const maxId = Number.isInteger(options.maxMessageId) ? options.maxMessageId : null;
+        const excludeId = Number.isInteger(options.excludeId) ? options.excludeId : null;
+        const invalid = [];
+        const outOfRange = [];
+        const seen = new Set();
+        const ids = [];
+        let excluded = false;
+        let truncated = false;
+
+        for (const rawToken of String(input ?? '').split(',')) {
+            const token = rawToken.trim();
+            if (!token) continue;
+            const match = token.match(FLOOR_TOKEN);
+            if (!match) {
+                invalid.push(token);
+                continue;
+            }
+            const first = Number(match[1]);
+            const second = match[2] === undefined ? first : Number(match[2]);
+            // A reversed range is an obvious typo with an obvious intent; read it the
+            // way it was meant rather than making the user notice the order.
+            const from = Math.min(first, second);
+            const to = Math.max(first, second);
+            if (maxId !== null && to > maxId) outOfRange.push(token);
+            const upper = maxId === null ? to : Math.min(to, maxId);
+            for (let id = from; id <= upper; id += 1) {
+                if (id === excludeId) {
+                    excluded = true;
+                    continue;
+                }
+                if (seen.has(id)) continue;
+                if (ids.length >= RANGE_EXPANSION_LIMIT) {
+                    truncated = true;
+                    break;
+                }
+                seen.add(id);
+                ids.push(id);
+            }
+        }
+
+        ids.sort((a, b) => a - b);
+        return { ids, excluded, invalid, outOfRange, truncated };
+    }
+
+    // Contiguous runs, so a 40-floor selection costs a handful of host calls instead
+    // of forty. Also what the collapsed summary line is written from.
+    function idsToRanges(ids) {
+        const sorted = [...new Set((ids || []).map(Number).filter(Number.isInteger))].sort((a, b) => a - b);
+        const ranges = [];
+        for (const id of sorted) {
+            const last = ranges[ranges.length - 1];
+            if (last && id === last.to + 1) last.to = id;
+            else ranges.push({ from: id, to: id });
+        }
+        return ranges;
+    }
+
+    function formatFloorRanges(ids) {
+        return idsToRanges(ids)
+            .map(range => (range.from === range.to ? String(range.from) : `${range.from}-${range.to}`))
+            .join('、');
+    }
+
+    // SillyTavern stores a rule's pattern as a /pattern/flags literal (verified on a
+    // live install), so it cannot be handed straight to RegExp.
+    // ══════ 純函式：正則規則 ══════
+
+    function parseRegexLiteral(source) {
+        const text = String(source ?? '').trim();
+        if (!text) return null;
+        const match = text.match(/^\/([\s\S]+)\/([a-z]*)$/);
+        return match ? { pattern: match[1], flags: match[2] } : { pattern: text, flags: '' };
+    }
+
+    function filterTrimStrings(value, trimStrings) {
+        let text = String(value ?? '');
+        for (const trim of trimStrings || []) {
+            const needle = String(trim ?? '');
+            if (needle) text = text.split(needle).join('');
+        }
+        return text;
+    }
+
+    // `{{match}}` is the regex feature that stands for the whole match; it is not one
+    // of SillyTavern's `{{user}}`-style macros and is handled here. Everything else in
+    // double braces is a macro this tool deliberately leaves alone (ADR-0003), so it
+    // has to be excluded before deciding whether a rule needs the macro warning.
+    function ruleUsesMacro(rule) {
+        const strip = value => String(value ?? '').replace(/\{\{match\}\}/gi, '');
+        return /\{\{/.test(strip(rule?.find_regex)) || /\{\{/.test(strip(rule?.replace_string));
+    }
+
+    // The checkbox is the only knob: a checked rule runs regardless of the depth,
+    // source, destination or enabled state it carries (ADR-0003). That is deliberate,
+    // but it was also silent — and a rule's own name usually advertises the very
+    // condition being disregarded ("5楼以下…", "以前的用户输入"). Worse, reference
+    // material is user floors and AI floors mixed together, so a rule written for one
+    // source is guaranteed to meet the other.
+    //
+    // These marks do not change what runs. They say, before the box is ticked, which
+    // of the rule's own conditions this tool is about to walk past.
+    function describeRuleOverrides(rule) {
+        const marks = [];
+        const destination = rule?.destination && typeof rule.destination === 'object' ? rule.destination : {};
+
+        // Deliberately a typeof check: min_depth is `number | null`, and Number(null)
+        // is a perfectly finite 0 — the same trap finiteOr() exists to avoid.
+        if (typeof rule?.min_depth === 'number' || typeof rule?.max_depth === 'number') {
+            marks.push('原本限定樓層深度，本工具會忽略、對所有參考樓層套用');
+        }
+        if (!destination.prompt) {
+            marks.push('原本不送進提示詞（多半是畫面美化用），套上去可能把版面標記混進參考資料');
+        }
+        return marks;
+    }
+
+    // `source` is the one condition this tool honours, and the reason it is different
+    // from depth is worth stating: depth says *when* a rule should run, but source
+    // declares *what kind of text it was written for*. Reference material is user
+    // floors and AI floors mixed together, so ignoring it is wrong about half of them
+    // by construction.
+    //
+    // It is also the only condition a user cannot work around by writing their own
+    // rule. A regex only ever sees a floor's text, never who wrote it — so "strip this
+    // from my own lines only" is not merely awkward to express, it is impossible.
+    // That is what makes this different from depth, where writing a purpose-built rule
+    // is a perfectly good answer. See ADR-0003.
+    // `world_info` is not a floor role — it is the role passed for world info entries,
+    // whose source in SillyTavern's own vocabulary is exactly that. Same principle as
+    // above: an entry is world info text, so a rule written for user input has no
+    // business rewriting it.
+    const REGEX_SOURCE_BY_ROLE = { user: 'user_input', assistant: 'ai_output', world_info: 'world_info' };
+
+    function ruleAppliesToRole(rule, role) {
+        const source = rule?.source;
+        // No usable declaration is not a restriction — do not let a malformed rule
+        // silently become one that never runs.
+        if (!source || typeof source !== 'object') return true;
+        const key = REGEX_SOURCE_BY_ROLE[role];
+        return key ? Boolean(source[key]) : false;
+    }
+
+    // Null when the rule covers both roles, so the caller can leave the row uncluttered.
+    function describeRuleScope(rule) {
+        const source = rule?.source && typeof rule.source === 'object' ? rule.source : null;
+        if (!source || (source.user_input && source.ai_output)) return null;
+        if (source.user_input) return '只套用在使用者樓層';
+        if (source.ai_output) return '只套用在 AI 樓層';
+        return '不套用在任何參考樓層';
+    }
+
+    // `role` is the role of the floor this text came from. Pass `undefined` only when
+    // the caller genuinely does not know it — that skips the source check entirely.
+    function applyTavernRegexes(text, rules, role) {
+        let output = String(text ?? '');
+        const failed = [];
+        let applied = 0;
+        for (const rule of rules || []) {
+            if (role !== undefined && !ruleAppliesToRole(rule, role)) continue;
+            applied += 1;
+            const literal = parseRegexLiteral(rule?.find_regex);
+            if (!literal) continue;
+            let regex;
+            try {
+                regex = new RegExp(literal.pattern, literal.flags);
+            } catch {
+                // A pattern this host accepted but this browser rejects must not take
+                // the whole feature down with it, and must not vanish either.
+                failed.push(String(rule?.script_name || rule?.id || '未命名規則'));
+                continue;
+            }
+            const template = String(rule?.replace_string ?? '').replace(/\{\{match\}\}/gi, '$0');
+            const trims = Array.isArray(rule?.trim_strings) ? rule.trim_strings : [];
+            try {
+                output = output.replace(regex, (...args) => {
+                    const groups = typeof args[args.length - 1] === 'object' ? args[args.length - 1] : null;
+                    const positional = args.slice(0, groups ? -3 : -2);
+                    return template.replace(/\$(\d+)|\$<([^>]+)>/g, (whole, index, name) => {
+                        const captured = name === undefined ? positional[Number(index)] : groups?.[name];
+                        return captured === undefined ? whole : filterTrimStrings(captured, trims);
+                    });
+                });
+            } catch {
+                failed.push(String(rule?.script_name || rule?.id || '未命名規則'));
+            }
+        }
+        return { text: output, failed, applied };
+    }
+
+    // A world info entry's uid is only unique inside its own book — the host's own type
+    // says so outright — so nothing may key on the uid alone. The separator is a NUL
+    // because a book name can contain anything a filename can.
+    // ══════ 純函式：世界書條目 ══════
+
+    function worldbookEntryKey(book, uid) {
+        return `${String(book ?? '')} ${String(uid ?? '')}`;
+    }
+
+    // The stored form is { book, uid } rather than the joined key, because settings are
+    // user-facing: they travel through the copy/paste backup, and a NUL byte sitting in
+    // the middle of a string there looks like corruption.
+    function normalizeWorldbookRef(raw) {
+        const book = String(raw?.book ?? '');
+        const uid = worldbookUid(raw?.uid);
+        if (!book || uid === null) return null;
+        return { book, uid };
+    }
+
+    // ⚠️ Not a bare Number() check. Number(null) and Number('') are both a perfectly
+    // finite 0, and 0 is a real uid — so a missing uid would quietly become a pick
+    // aimed at the first entry of the book. Same trap finiteOr() exists to avoid.
+    function worldbookUid(value) {
+        if (value === null || value === undefined || value === '') return null;
+        const uid = Number(value);
+        return Number.isFinite(uid) ? uid : null;
+    }
+
+    function dedupeWorldbookRefs(refs) {
+        const seen = new Map();
+        for (const ref of refs || []) {
+            if (ref) seen.set(worldbookEntryKey(ref.book, ref.uid), ref);
+        }
+        return [...seen.values()];
+    }
+
+    // Keeps only the fields this tool uses, and tolerates a malformed entry rather than
+    // letting one bad record take a whole book down. Returns null when the entry has no
+    // usable uid: without one it cannot be selected, and a row nobody can tick is worse
+    // than a row that is not there.
+    function normalizeWorldbookEntry(raw, book) {
+        const uid = worldbookUid(raw?.uid);
+        if (uid === null) return null;
+        const strategy = raw?.strategy && typeof raw.strategy === 'object' ? raw.strategy : {};
+        // `keys` is `(string | RegExp)[]` in the host's type. String() on a RegExp gives
+        // back its literal form, which is exactly what should be shown and searched.
+        const keys = Array.isArray(strategy.keys) ? strategy.keys.map(String).filter(Boolean) : [];
+        return {
+            key: worldbookEntryKey(book, uid),
+            book: String(book ?? ''),
+            uid,
+            name: String(raw?.name ?? '').trim(),
+            enabled: raw?.enabled !== false,
+            type: ['constant', 'selective', 'vectorized'].includes(strategy.type) ? strategy.type : 'selective',
+            keys,
+            content: String(raw?.content ?? ''),
+        };
+    }
+
+    // States which of the entry's own conditions this tool is walking past, in the same
+    // spirit as describeRuleOverrides(): ticking the box is the only knob, so the row
+    // has to say what the box is overriding before it is ticked.
+    function describeWorldbookEntry(entry) {
+        const marks = [];
+        if (entry?.type === 'constant') marks.push('藍燈（常駐）');
+        else if (entry?.type === 'vectorized') marks.push('向量化');
+        else marks.push('綠燈（關鍵字）');
+        if (entry?.enabled === false) marks.push('SillyTavern 裡已停用');
+        const keys = Array.isArray(entry?.keys) ? entry.keys : [];
+        if (keys.length) marks.push(`關鍵字：${keys.slice(0, 3).join('、')}${keys.length > 3 ? '…' : ''}`);
+        return marks;
+    }
+
+    function filterWorldbookEntries(entries, query) {
+        const needle = String(query ?? '').trim().toLowerCase();
+        if (!needle) return [...(entries || [])];
+        return (entries || []).filter(entry => {
+            if (String(entry?.name ?? '').toLowerCase().includes(needle)) return true;
+            if (String(entry?.book ?? '').toLowerCase().includes(needle)) return true;
+            return (entry?.keys || []).some(key => String(key).toLowerCase().includes(needle));
+        });
+    }
+
+    // `角色: 內容` rather than bare text, and numbered so the model can tell how far
+    // apart two excerpts sit. Sorted oldest first, which also puts the excerpt nearest
+    // the edited floor closest to the end, where weight is highest.
+    //
+    // World info comes before the floors for the same reason: setting is background,
+    // floors are the story, and the floors sit nearer the thing being edited.
+    //
+    // ⚠️ Zero regression: with no world info entries this must produce exactly the
+    // string 0.4.0 produced. Both kinds share one wrapper and one identity paragraph —
+    // a second wrapper would mean repeating "read-only, never take search text from
+    // this" a third time, and it is already said in the protocol and here.
+    // ══════ 純函式：組裝提示詞 ══════
+
+    function buildReferenceBlock(entries, worldbookEntries) {
+        const books = (worldbookEntries || []).filter(entry => String(entry?.content ?? '').length);
+        const rows = (entries || []).filter(entry => String(entry?.text ?? '').length);
+        if (!books.length && !rows.length) return '';
+        const sections = [];
+        if (books.length) {
+            sections.push(books
+                .map(entry => `[world info: ${entry.book}] ${entry.name || '(untitled)'}:\n${entry.content}`)
+                .join('\n\n'));
+        }
+        if (rows.length) {
+            sections.push(rows.map(entry => `[#${entry.id}] ${entry.name || '未知'}:\n${entry.text}`).join('\n\n'));
+        }
+        return [
+            MARK.referenceOpen,
+            REFERENCE_IDENTITY,
+            '',
+            sections.join('\n\n'),
+            MARK.referenceClose,
+        ].join('\n');
+    }
+
+    // ⚠️ Zero regression: with no reference material this must produce exactly what
+    // 0.3.0 produced, apart from the markers now being full-width. The reminder line,
+    // the extra protocol sentence and the reference block all appear only when there
+    // is reference material to justify them — otherwise this release would quietly
+    // change the behaviour of every existing command.
+    function buildPrompt(action, scope, role, options = {}) {
+        const reference = String(options.referenceBlock ?? '').trim();
+        const globalPrompt = String(options.globalPrompt ?? '');
+        const instruction = action.instruction.trim();
+        const scopeLabel = scope.hasSelection ? 'a selected passage' : 'the whole message';
+        const contextBlocks = scope.hasSelection
+            ? [
+                MARK.targetOpen,
+                scope.fullText,
+                MARK.targetClose,
+                '',
+                MARK.scopeOpen,
+                scope.text,
+                MARK.scopeClose,
+            ]
+            : [
+                MARK.fullScopeOpen,
+                scope.text,
+                MARK.fullScopeClose,
+            ];
+        const userPrompt = [
+            `Task: ${instruction}`,
+            `The editable scope is ${scopeLabel} written by the ${role}.`,
+            '',
+            ...(reference ? [reference, ''] : []),
+            ...contextBlocks,
+            ...(reference ? ['', `Reminder — your task: ${instruction}`] : []),
+        ].join('\n');
+        const protocol = reference && action.mode === 'patch'
+            ? `${LOCKED_PROTOCOL.patch}\n${PATCH_REFERENCE_RULE}`
+            : LOCKED_PROTOCOL[action.mode];
+        const editablePrompt = action.systemPrompt?.trim() || globalPrompt.trim();
+        return [
+            { role: 'system', content: `${protocol}\n\nEditing principles:\n${editablePrompt}` },
+            { role: 'user', content: userPrompt },
+        ];
+    }
+
+    // ══════ 純函式：更新檢查 ══════
+
+    function compareVersions(left, right) {
+        const parse = value => String(value ?? '').split('.').map(part => Number.parseInt(part, 10) || 0);
+        const a = parse(left);
+        const b = parse(right);
+        for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+            const difference = (a[index] || 0) - (b[index] || 0);
+            if (difference) return difference > 0 ? 1 : -1;
+        }
+        return 0;
+    }
+
+    // The same expression tools/build-import.cjs and the tests use to find the version.
+    // Three readers, one spelling — change one and the others stop agreeing in silence.
+    //
+    // ⚠️ The capture must start with digits, and that is not tidiness. This very line is
+    // part of the source being searched, so a pattern of `'([^']+)'` matches its own
+    // spelling here and hands back `([^` as the version. Harmless while the real constant
+    // is above it, silently wrong the moment that constant is renamed.
+    function readVersionFromSource(source) {
+        return String(source ?? '').match(/const VERSION = '(\d+\.\d+\.\d+[^']*)'/)?.[1] || '';
+    }
+
+    // Everything that is checked before a byte of downloaded code is allowed near the
+    // script library. Not a security boundary — a repository that ships bad code passes
+    // all of this — but it does stop the ordinary failures: a truncated download, a
+    // captive portal, a 404 page served as 200, or the right file from the wrong project.
+    function inspectUpdateSource(source, currentVersion) {
+        const text = String(source ?? '');
+        if (!text.trim()) return { ok: false, error: '更新來源回傳空白內容，已中止。' };
+        if (text.length < UPDATE_MIN_LENGTH) {
+            return { ok: false, error: `抓到的內容只有 ${text.length.toLocaleString('en-US')} 字元，不像完整的腳本，已中止。` };
+        }
+        if (!text.includes('bootstrapInlineAiEditor') || !text.includes(SETTINGS_KEY)) {
+            return { ok: false, error: '抓到的內容不是 AI 內文編輯器的腳本，已中止。' };
+        }
+        const version = readVersionFromSource(text);
+        if (!version) return { ok: false, error: '抓到的內容裡讀不到版號，已中止。' };
+        return { ok: true, version, newer: compareVersions(version, currentVersion) > 0 };
+    }
+
+    // ══════ 測試出口（之前不得有 await） ══════
+
+    const TEST_API = {
+        normalizeSettings,
+        normalizeBuiltinOverrides,
+        sortCommandsByGroup,
+        commandGroupNames,
+        resolveCommands,
+        serializeSettings,
+        parseSettingsPayload,
+        serializeCommands,
+        parseCommandsPayload,
+        createScriptVariableStore,
+        parseSearchReplacePairs,
+        applySearchReplacePairs,
+        parseAiResponse,
+        applyScope,
+        tokenizeForDiff,
+        computeDiffRows,
+        composeSelectedRows,
+        parseFloorRange,
+        idsToRanges,
+        formatFloorRanges,
+        parseRegexLiteral,
+        ruleUsesMacro,
+        describeRuleOverrides,
+        describeRuleScope,
+        ruleAppliesToRole,
+        applyTavernRegexes,
+        worldbookEntryKey,
+        normalizeWorldbookRef,
+        dedupeWorldbookRefs,
+        normalizeWorldbookEntry,
+        describeWorldbookEntry,
+        filterWorldbookEntries,
+        buildReferenceBlock,
+        buildPrompt,
+        compareVersions,
+        readVersionFromSource,
+        inspectUpdateSource,
+        MARK,
+    };
+
+    if (globalScope.__STIAE_TEST__) {
+        globalScope.__STIAE_TEST_API__ = TEST_API;
+        return;
+    }
+
+    const hostWindow = globalScope.parent?.document ? globalScope.parent : globalScope;
+    const hostDocument = hostWindow.document;
+    const tavern = globalScope.TavernHelper || hostWindow.TavernHelper;
+    const $ = hostWindow.jQuery || globalScope.jQuery;
+
+    if (!hostDocument || !tavern || !$) {
+        console.error('[ST Inline AI Editor] TavernHelper or the SillyTavern document is unavailable.');
+        return;
+    }
+
+    const previousInstance = hostWindow[INSTANCE_KEY];
+    if (previousInstance?.destroy) previousInstance.destroy();
+
+    const state = {
+        settings: null,
+        activeEditor: null,
+        activeReview: null,
+        activeSettings: null,
+        activeConfirm: null,
+        activeWorldbook: null,
+        observer: null,
+        destroyed: false,
+        cleanup: [],
+        // latest is what the last check saw; it is also restored from settings on
+        // startup so the notice survives a page reload without asking GitHub again.
+        update: { checking: false, installing: false, checked: false, latest: '', error: '' },
+        // Set while the settings dialog is open so a check that finishes can redraw its
+        // own section. Null the rest of the time — this feature must not keep the dialog
+        // alive after it closes.
+        updateRender: null,
+    };
+    const variableStore = createScriptVariableStore(globalScope, tavern);
+
+    // ══════ 宿主繫結、狀態與共用小工具 ══════
+
+    function toast(type, message) {
+        const service = hostWindow.toastr || globalScope.toastr;
+        if (service?.[type]) service[type](message);
+        else console[type === 'error' ? 'error' : 'log'](`[ST Inline AI Editor] ${message}`);
+    }
+
+    function createElement(tag, className = '', text = '') {
+        const element = hostDocument.createElement(tag);
+        if (className) element.className = className;
+        if (text !== '') element.textContent = text;
+        return element;
+    }
+
+    function button(label, icon = '', className = '') {
+        const element = createElement('button', `menu_button stiae-button ${className}`.trim());
+        element.type = 'button';
+        if (icon) element.append(createElement('i', `fa-solid ${icon}`));
+        element.append(createElement('span', '', label));
+        return element;
+    }
+
+    function readSettings() {
+        try {
+            const variables = variableStore.read();
+            return normalizeSettings(variables[SETTINGS_KEY]);
+        } catch (error) {
+            console.error('[ST Inline AI Editor] Could not read settings.', error);
+            return normalizeSettings();
+        }
+    }
+
+    function saveSettings() {
+        try {
+            const variables = variableStore.read();
+            variables[SETTINGS_KEY] = clone(state.settings);
+            variableStore.write(variables);
+        } catch (error) {
+            console.error('[ST Inline AI Editor] Could not save settings.', error);
+            toast('error', '無法儲存編輯器設定。');
+        }
+    }
+
+    function getContext() {
+        return globalScope.SillyTavern?.getContext?.() || hostWindow.SillyTavern?.getContext?.();
+    }
+
+    function getProfiles() {
+        try {
+            const context = getContext();
+            const service = context?.ConnectionManagerRequestService;
+            if (!service) return [];
+            return service.getSupportedProfiles().slice().sort((a, b) => a.name.localeCompare(b.name));
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not list Connection Profiles.', error);
+            return [];
+        }
+    }
+
+    function addProfileOptions(select, selectedId, includeInherit = false) {
+        select.replaceChildren();
+        const profiles = getProfiles();
+        const empty = createElement('option', '', includeInherit ? '沿用全域設定' : '請選擇 Connection Profile');
+        empty.value = '';
+        select.append(empty);
+        for (const profile of profiles) {
+            const option = createElement('option', '', profile.name);
+            option.value = profile.id;
+            select.append(option);
+        }
+        if (selectedId && !profiles.some(profile => profile.id === selectedId)) {
+            const missing = createElement('option', '', `⚠ 已遺失的 Profile (${selectedId})`);
+            missing.value = selectedId;
+            select.append(missing);
+        }
+        select.value = selectedId || '';
+        return profiles;
+    }
+
+    // ══════ 樣式表 ══════
+
+    function injectStyles() {
+        hostDocument.getElementById(STYLE_ID)?.remove();
+        const style = createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = `
+            /* ⚠️ --stiae-muted must NOT be SmartThemeQuoteColor. That variable is an
+               accent — on plenty of themes it is a saturated orange — and every piece of
+               explanatory text in this tool uses --stiae-muted. Pointing it at the accent
+               made the help text louder than the headings it sits under, and made the
+               reference rows blend into everything else. It is now the body colour faded,
+               so it follows the theme while staying quieter than the text it explains.
+               The flat colour on the line before is the fallback for browsers without
+               color-mix(); the second declaration simply wins where it is supported. */
+            .${ROOT_CLASS} { --stiae-bg: var(--SmartThemeBlurTintColor, #24242a); --stiae-fg: var(--SmartThemeBodyColor, #eee); --stiae-border: var(--SmartThemeBorderColor, #666); --stiae-accent: var(--SmartThemeQuoteColor, #7aa2d8); --stiae-muted: #9aa3b2; --stiae-muted: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 58%, transparent); color: var(--stiae-fg); font-size: var(--mainFontSize, 15px); }
+            .stiae-overlay { position: fixed; inset: 0; z-index: 45000; background: rgba(0,0,0,.58); display: flex; align-items: center; justify-content: center; padding: 18px; box-sizing: border-box; backdrop-filter: blur(2px); }
+            .stiae-overlay.stiae-review-layer { z-index: 45200; }
+            .stiae-overlay.stiae-sub-layer { z-index: 45300; }
+            .stiae-overlay.stiae-confirm-layer { z-index: 45400; }
+            .stiae-confirm-modal { position: relative; width: min(430px, calc(100vw - 36px)); background: var(--stiae-bg); color: var(--stiae-fg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); display: flex; flex-direction: column; overflow: hidden; }
+            /* pre-line so a confirmation can use blank lines to separate "what is about
+               to happen" from "what it costs you". Messages without newlines are unchanged. */
+            .stiae-confirm-text { padding: 18px 18px 4px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-line; }
+            .stiae-modal { position: fixed; display: flex; flex-direction: column; min-width: 520px; min-height: 420px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow: hidden; resize: both; background: var(--stiae-bg); color: var(--stiae-fg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); }
+            .stiae-review-modal { position: relative; width: min(1180px, calc(100vw - 36px)); height: min(820px, calc(100vh - 36px)); resize: both; }
+            .stiae-settings-modal { position: relative; width: min(900px, calc(100vw - 36px)); max-height: min(850px, calc(100vh - 36px)); background: var(--stiae-bg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); display: flex; flex-direction: column; overflow: hidden; }
+            .stiae-header { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--stiae-border); cursor: move; user-select: none; }
+            .stiae-header strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .stiae-close { border: 0; background: transparent; color: inherit; font-size: 22px; cursor: pointer; padding: 0 5px; opacity: .8; }
+            .stiae-close:hover { opacity: 1; }
+            .stiae-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-bottom: 1px solid var(--stiae-border); overflow-x: auto; }
+            .stiae-toolbar-spacer { flex: 1; }
+            .stiae-button { display: inline-flex !important; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; min-height: 34px; }
+            .stiae-icon-button span { display: none; }
+            .stiae-more { position: relative; }
+            .stiae-more > summary { list-style: none; cursor: pointer; }
+            .stiae-more > summary::-webkit-details-marker { display: none; }
+            .stiae-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 3; min-width: 190px; max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 7px; background: var(--stiae-bg); border: 1px solid var(--stiae-border); border-radius: 7px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+            .stiae-menu .stiae-button { width: 100%; justify-content: flex-start; }
+            .stiae-mobile-menu-item { display: none !important; }
+            .stiae-scope { flex: 0 0 auto; padding: 7px 13px; color: var(--stiae-muted); border-bottom: 1px solid var(--stiae-border); font-size: .9em; }
+            .stiae-scope.is-selection { color: var(--SmartThemeEmColor, #f1d37a); }
+            .stiae-reference { flex: 0 0 auto; border-bottom: 1px solid var(--stiae-border); }
+            .stiae-reference[open] { max-height: 46vh; overflow-y: auto; }
+            .stiae-reference-summary { cursor: pointer; padding: 7px 13px; color: var(--stiae-muted); font-size: .9em; overflow-wrap: anywhere; }
+            .stiae-reference-summary::-webkit-details-marker { display: none; }
+            .stiae-reference-body { padding: 0 13px 11px; display: flex; flex-direction: column; gap: 7px; }
+            .stiae-reference-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+            .stiae-reference-input { flex: 1 1 190px; min-width: 0; box-sizing: border-box; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 5px; background: rgba(0,0,0,.18); color: var(--stiae-fg); font-family: inherit; font-size: 1em; }
+            .stiae-reference-notes { display: flex; flex-direction: column; gap: 4px; }
+            .stiae-reference-bad { color: #ffb0b0; font-size: .88em; }
+            .stiae-reference-list { display: flex; flex-direction: column; gap: 3px; font-size: .88em; }
+            /* Three ranks in one line, and they have to read as three: the floor number is
+               the anchor you scan for, the role and name are a label, the text is the
+               content. Before 0.7.0 the number and the label both landed on the theme
+               accent and the row came out as one loud stripe. */
+            .stiae-ref-row { display: flex; gap: 8px; align-items: baseline; padding: 3px 6px; border-radius: 5px; background: rgba(0,0,0,.14); }
+            .stiae-ref-id { flex: 0 0 auto; font-weight: 700; color: var(--stiae-accent); }
+            .stiae-ref-meta { flex: 0 0 auto; color: var(--stiae-muted); font-size: .88em; }
+            .stiae-ref-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .92; }
+            .stiae-ref-excluded { opacity: .6; }
+            /* The row the editor keeps: the cost of this request stays visible without
+               opening anything, which is the whole reason the summary exists. */
+            .stiae-wb-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 9px; border: 1px solid var(--stiae-border); border-radius: 6px; }
+            .stiae-wb-summary { flex: 1 1 190px; min-width: 0; color: var(--stiae-muted); font-size: .9em; overflow-wrap: anywhere; }
+            .stiae-wb-modal { width: min(760px, calc(100vw - 36px)); height: min(760px, calc(100vh - 36px)); max-height: min(760px, calc(100vh - 36px)); resize: both; }
+            /* Only the entry list scrolls. The search box and the book dropdown stay put
+               while you work through a book — that pinning is the point of the dialog, and
+               it is why the list no longer needs a nested scroller of its own. */
+            .stiae-wb-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 7px; padding: 12px 14px; }
+            .stiae-wb-selected { flex: 0 0 auto; display: flex; align-items: flex-start; gap: 7px; flex-wrap: wrap; max-height: 26%; overflow-y: auto; }
+            .stiae-wb-groups { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
+            .stiae-wb-picker { flex: 1 1 100%; min-width: 0; box-sizing: border-box; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 5px; background: rgba(0,0,0,.18); color: var(--stiae-fg); font-family: inherit; font-size: 1em; }
+            .stiae-wb-booktitle { margin-top: 7px; color: var(--stiae-muted); font-size: .88em; }
+            .stiae-wb-chips { display: flex; flex-wrap: wrap; gap: 5px; width: 100%; }
+            .stiae-wb-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 3px 4px 3px 8px; border: 1px solid var(--stiae-border); border-radius: 11px; font-size: .85em; overflow-wrap: anywhere; }
+            .stiae-wb-chip-x { flex: 0 0 auto; padding: 0 5px; border: 0; border-radius: 50%; background: transparent; color: var(--stiae-muted); cursor: pointer; font: inherit; line-height: 1.6; }
+            .stiae-wb-chip-x:hover { color: #ff9b9b; }
+            /* No max-height and no scroller of its own: .stiae-wb-groups above is the one
+               scrolling region now. WORLDBOOK_ROW_LIMIT still bounds how many rows exist. */
+            .stiae-wb-list { display: flex; flex-direction: column; gap: 4px; padding: 4px 0 4px 9px; }
+            .stiae-wb-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px; border: 1px solid var(--stiae-border); border-radius: 6px; cursor: pointer; font-size: .88em; }
+            .stiae-wb-row input { width: auto; margin-top: 3px; }
+            .stiae-wb-row > div { flex: 1 1 auto; min-width: 0; }
+            .stiae-reference-full > summary { cursor: pointer; color: var(--stiae-muted); font-size: .88em; }
+            .stiae-reference-pre { max-height: 240px; overflow: auto; margin: 6px 0 0; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            .stiae-request-preview { margin-bottom: 9px; border: 1px solid var(--stiae-border); border-radius: 7px; padding: 8px; }
+            .stiae-request-preview > summary { cursor: pointer; color: var(--stiae-muted); }
+            .stiae-request-role { margin: 8px 0 3px; font-weight: 700; font-size: .88em; color: var(--stiae-muted); }
+            .stiae-request-body { max-height: 300px; overflow: auto; margin: 0; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            .stiae-regex-section { margin-bottom: 13px; }
+            .stiae-regex-section > summary { cursor: pointer; }
+            .stiae-regex-body { display: flex; flex-direction: column; gap: 7px; padding-top: 7px; }
+            .stiae-regex-list { display: flex; flex-direction: column; gap: 5px; max-height: 320px; overflow-y: auto; }
+            .stiae-regex-row { display: flex; align-items: flex-start; gap: 8px; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 6px; cursor: pointer; }
+            .stiae-regex-row input { width: auto; margin-top: 3px; }
+            .stiae-regex-override { margin-top: 3px; color: #ffc98a; font-size: .84em; line-height: 1.45; }
+            .stiae-editor-body { flex: 1 1 auto; min-height: 0; padding: 12px; display: flex; }
+            .stiae-editor-text { width: 100%; height: 100%; min-height: 230px; resize: none; box-sizing: border-box; padding: 12px; border: 1px solid var(--stiae-border); border-radius: 7px; background: rgba(0,0,0,.18); color: var(--stiae-fg); font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+            .stiae-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px; padding: 10px 13px; border-top: 1px solid var(--stiae-border); }
+            .stiae-primary { border-color: var(--SmartThemeQuoteColor, #7aa2d8) !important; }
+            .stiae-danger { color: #ff9b9b !important; }
+            .stiae-review-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px; }
+            .stiae-status { margin-bottom: 9px; color: var(--stiae-muted); }
+            .stiae-warning { margin: 0 0 9px; padding: 8px 10px; border: 1px solid #c79036; border-radius: 6px; color: #ffd38a; background: rgba(150,95,10,.18); }
+            .stiae-stream { min-height: 260px; margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 7px; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            .stiae-diff-tabs { display: none; gap: 6px; margin-bottom: 8px; }
+            .stiae-diff-title { position: sticky; top: 0; z-index: 1; padding: 7px 10px; font-weight: 700; background: var(--stiae-bg); border-bottom: 1px solid var(--stiae-border); font-family: var(--mainFontFamily, system-ui), sans-serif; }
+            .stiae-word-removed { background: rgba(235,70,70,.42); text-decoration: line-through; }
+            .stiae-word-added { background: rgba(65,205,105,.38); }
+            .stiae-diff-empty { opacity: .35; }
+            .stiae-diff-grid { --stiae-gate-width: 46px; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); border: 1px solid var(--stiae-border); border-radius: 7px; overflow: hidden; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            .stiae-diff-grid.stiae-has-gate { grid-template-columns: var(--stiae-gate-width) minmax(0,1fr) minmax(0,1fr); }
+            .stiae-diff-gate { display: flex; align-items: flex-start; justify-content: center; padding-top: 2px; }
+            .stiae-diff-title.stiae-diff-gate { align-items: center; padding: 7px 2px; font-size: .82em; white-space: nowrap; color: var(--stiae-muted); }
+            .stiae-diff-checkbox { width: 17px; height: 17px; margin: 0; accent-color: var(--SmartThemeQuoteColor, #7aa2d8); cursor: pointer; }
+            .stiae-diff-cell { min-width: 0; min-height: 1.55em; padding: 1px 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+            .stiae-diff-cell.removed { background: rgba(220,70,70,.19); }
+            .stiae-diff-cell.added { background: rgba(70,190,105,.18); }
+            .stiae-diff-off { opacity: .38; }
+            .stiae-full-preview { margin-top: 12px; border: 1px solid var(--stiae-border); border-radius: 7px; padding: 8px; }
+            .stiae-full-preview > summary { cursor: pointer; color: var(--stiae-muted); }
+            .stiae-full-preview .stiae-diff-grid { margin-top: 8px; }
+            .stiae-settings-body { overflow: auto; padding: 14px; }
+            .stiae-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 13px; }
+            .stiae-field > label { font-weight: 700; }
+            /* Section headings. The settings dialog is one long scroll, so a heading has
+               to be findable while skimming: bigger than the body text, full brightness
+               (help text is the faded one), and carrying the rule that separates it from
+               the section above. That rule is why there is no separate divider element —
+               having both produced two lines with a gap between them. */
+            .stiae-field-label { margin: 30px 0 12px; padding-top: 20px; border-top: 1px solid var(--stiae-border); color: var(--stiae-fg); font-size: 1.12em; font-weight: 700; }
+            .stiae-settings-body > .stiae-field-label:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+            /* Counts and other asides that ride along with a heading without competing. */
+            .stiae-label-note { margin-left: 9px; color: var(--stiae-muted); font-size: .8em; font-weight: 400; }
+            .stiae-button-row { margin: 12px 0 9px; }
+            .stiae-settings-body > .stiae-checkbox { margin: 11px 0; }
+            .stiae-help { color: var(--stiae-muted); font-size: .88em; line-height: 1.5; }
+            .stiae-help + .stiae-help { margin-top: 7px; }
+            /* The browser default link blue belongs to no SillyTavern theme. */
+            .stiae-help a { color: var(--stiae-accent); }
+            /* Disabled has to look disabled: the up/down arrows at a group boundary and
+               the update button with nothing to install are both disabled buttons that
+               otherwise look exactly like working ones. */
+            .stiae-button:disabled { opacity: .42; cursor: default; }
+            .stiae-field input, .stiae-field select, .stiae-field textarea { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 5px; background: rgba(0,0,0,.18); color: var(--stiae-fg); font-family: inherit; font-size: 1em; }
+            .stiae-field input::placeholder, .stiae-field textarea::placeholder { color: var(--stiae-muted); opacity: .75; }
+            .stiae-field select option { background: var(--stiae-bg); color: var(--stiae-fg); }
+            .stiae-field textarea { min-height: 92px; resize: vertical; }
+            .stiae-field textarea.stiae-payload-text { min-height: 170px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
+            .stiae-command-list { display: flex; flex-direction: column; gap: 7px; }
+            .stiae-command-group { margin-top: 7px; padding-bottom: 2px; border-bottom: 1px solid var(--stiae-border); color: var(--stiae-muted); font-size: .88em; font-weight: 700; }
+            .stiae-command-group:first-child { margin-top: 0; }
+            .stiae-menu-group { padding: 6px 6px 2px; color: var(--stiae-muted); font-size: .82em; font-weight: 700; }
+            /* Pairs with .stiae-mobile-menu-item: a group whose commands are all pinned
+               to the toolbar has nothing under it on desktop, so its heading goes too. */
+            .stiae-menu-group-mobile { display: none; }
+            .stiae-command-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--stiae-border); border-radius: 7px; }
+            .stiae-command-row-actions { display: flex; gap: 4px; }
+            .stiae-command-row-actions button { min-width: 34px; }
+            .stiae-inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+            .stiae-checkbox { display: flex; align-items: center; gap: 7px; }
+            .stiae-checkbox input { width: auto; }
+            .stiae-hidden { display: none !important; }
+            /* The only outward sign of an available update: a dot on the settings button.
+               An update is never urgent enough to interrupt what is being edited. */
+            .stiae-has-update { position: relative; }
+            .stiae-has-update::after { content: ''; position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--SmartThemeEmColor, #f1d37a); }
+            .stiae-wand { color: var(--SmartThemeEmColor, inherit); }
+            @media (max-width: 760px) {
+                .stiae-overlay { padding: 0; }
+                .stiae-modal, .stiae-review-modal, .stiae-settings-modal { inset: 0 !important; width: 100vw !important; height: 100dvh !important; max-width: none; max-height: none; min-width: 0; min-height: 0; border-radius: 0; resize: none; }
+                /* The confirmation stays a small box even here — going full screen
+                   would hide which dialog asked the question. */
+                .stiae-overlay.stiae-confirm-layer { padding: 16px; }
+                .stiae-header { cursor: default; }
+                .stiae-desktop-pin { display: none !important; }
+                .stiae-mobile-menu-item { display: inline-flex !important; }
+                .stiae-menu-group-mobile { display: block; }
+                .stiae-diff-tabs { display: flex; }
+                /* One text column at a time, chosen by the tabs. The gutter stays,
+                   so a change can still be declined without switching sides. */
+                .stiae-diff-grid { grid-template-columns: minmax(0,1fr); }
+                .stiae-diff-grid.stiae-has-gate { grid-template-columns: var(--stiae-gate-width) minmax(0,1fr); }
+                .stiae-diff-grid[data-active="proposed"] .original,
+                .stiae-diff-grid[data-active="original"] .proposed { display: none; }
+                .stiae-inline-fields { grid-template-columns: 1fr; }
+                .stiae-button span { display: inline; }
+                .stiae-toolbar { flex-wrap: nowrap; }
+                .stiae-reference[open] { max-height: 52vh; }
+                .stiae-reference-input { flex: 1 1 100%; }
+                .stiae-ref-row { flex-wrap: wrap; }
+                .stiae-ref-text { flex: 1 1 100%; white-space: normal; }
+            }
+        `;
+        hostDocument.head.append(style);
+    }
+
+    // ══════ 宿主 API 包裝：樓層、正則、世界書 ══════
+
+    function waitForDocument() {
+        return new Promise(resolve => {
+            if (hostDocument.body && hostDocument.querySelector('#chat')) return resolve();
+            const started = Date.now();
+            const timer = hostWindow.setInterval(() => {
+                if (hostDocument.body && hostDocument.querySelector('#chat')) {
+                    hostWindow.clearInterval(timer);
+                    resolve();
+                } else if (Date.now() - started > 15000) {
+                    hostWindow.clearInterval(timer);
+                    resolve();
+                }
+            }, 200);
+        });
+    }
+
+    function getMessage(messageId, includeSwipes = false) {
+        return tavern.getChatMessages(Number(messageId), { include_swipes: includeSwipes })?.[0] || null;
+    }
+
+    function getChatMaxMessageId() {
+        try {
+            const last = tavern.getChatMessages('-1')?.[0];
+            const id = Number(last?.message_id);
+            return Number.isInteger(id) ? id : null;
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not determine the chat length.', error);
+            return null;
+        }
+    }
+
+    // One host call per contiguous run instead of one per floor. The comma form the
+    // editor accepts is *not* passed through: the host answers it with an empty array
+    // and no error, which would hand the user a silently empty reference.
+    function fetchFloors(ids) {
+        const found = new Map();
+        for (const range of idsToRanges(ids)) {
+            const query = range.from === range.to ? String(range.from) : `${range.from}-${range.to}`;
+            try {
+                for (const message of tavern.getChatMessages(query) || []) {
+                    found.set(Number(message.message_id), message);
+                }
+            } catch (error) {
+                console.warn(`[ST Inline AI Editor] Could not read floors ${query}.`, error);
+            }
+        }
+        return ids.map(id => found.get(id)).filter(Boolean);
+    }
+
+    // Read fresh every time rather than cached: character-scoped rules change with the
+    // character card, and a stale list would quietly apply the wrong set. Returns null
+    // when the host could not be asked at all, which the UI reports rather than
+    // silently treating as "no rules".
+    async function readTavernRegexes() {
+        try {
+            // ⚠️ The newer `{ type: 'all' }` option throws on this host; the older
+            // scope/enable_state pair is the working form (verified on a live install).
+            const rules = await tavern.getTavernRegexes({ scope: 'all', enable_state: 'all' });
+            return Array.isArray(rules) ? rules : [];
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not list SillyTavern regex rules.', error);
+            return null;
+        }
+    }
+
+    // Everything below reads world info and nothing else. This tool never calls
+    // SillyTavern's own recall engine (getWorldInfoPrompt) and never writes to a book.
+    //
+    // ⚠️ Not an oversight — see ADR-0004. A recall would match normal chat exactly, but
+    // `isDryRun: true` does not gate three of its side effects, and one of them cannot
+    // be undone from here: the scan clears the static map holding entries other
+    // extensions queued for the user's *next* real generation. Running a recall inside
+    // this editor would silently change the next normal reply.
+    function worldbookApiAvailable() {
+        return typeof tavern.getWorldbook === 'function' && typeof tavern.getWorldbookNames === 'function';
+    }
+
+    // A book can be reachable through more than one route; the first route found wins so
+    // the label stays stable. Each getter is guarded separately because one of them
+    // failing (no character open, for instance) must not cost the other two.
+    function collectActiveWorldbooks() {
+        const found = new Map();
+        const add = (name, origin) => {
+            const value = String(name || '').trim();
+            if (value && !found.has(value)) found.set(value, origin);
+        };
+        try {
+            for (const name of tavern.getGlobalWorldbookNames?.() || []) add(name, '全域啟用');
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not list global world info books.', error);
+        }
+        try {
+            const bound = tavern.getCharWorldbookNames?.('current') || {};
+            add(bound.primary, '角色卡');
+            for (const name of bound.additional || []) add(name, '角色卡');
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not list character world info books.', error);
+        }
+        try {
+            add(tavern.getChatWorldbookName?.('current'), '聊天');
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not read the chat world info book.', error);
+        }
+        return found;
+    }
+
+    // A plain read with no side effects, unlike the world info recall engine this project
+    // deliberately does not call (ADR-0004). Returns '' when it cannot be determined,
+    // which the callers treat as "do not restore anything".
+    function currentChatId() {
+        try {
+            return String(getContext()?.getCurrentChatId?.() ?? '');
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not determine the current chat id.', error);
+            return '';
+        }
+    }
+
+    function worldbookOrigin(session, name) {
+        return session.worldbookOrigins?.get(name) || '未啟用';
+    }
+
+    // Books are cached by name in one map rather than kept as two separate lists, because
+    // a remembered pick can name a book this chat does not have active — that book has to
+    // be loadable on its own, before and independently of either group.
+    //
+    // A book that cannot be read is still recorded, carrying its error: an unreadable book
+    // and an empty one look identical otherwise.
+    async function loadWorldbooks(session, names) {
+        const wanted = [...new Set([...names].map(String).filter(Boolean))]
+            .filter(name => !session.worldbookBooks.has(name));
+        if (!wanted.length) return;
+        const groups = await Promise.all(wanted.map(async name => {
+            try {
+                const raw = await tavern.getWorldbook(name);
+                const entries = (Array.isArray(raw) ? raw : [])
+                    .map(entry => normalizeWorldbookEntry(entry, name))
+                    .filter(Boolean);
+                return { book: name, entries, error: null };
+            } catch (error) {
+                console.warn(`[ST Inline AI Editor] Could not read world info book "${name}".`, error);
+                return { book: name, entries: [], error: String(error?.message || error) };
+            }
+        }));
+        if (state.activeEditor !== session) return;
+        for (const group of groups) session.worldbookBooks.set(group.book, group);
+    }
+
+    // Active books first, then the rest — the same order the dropdown shows, so search
+    // results and the picker never disagree about where a book sits.
+    function worldbookBookGroups(session) {
+        return [...session.worldbookOrigins.keys(), ...(session.worldbookOtherNames || [])]
+            .map(name => session.worldbookBooks.get(name))
+            .filter(Boolean)
+            .map(group => ({ ...group, origin: worldbookOrigin(session, group.book) }));
+    }
+
+    // Names only — no entries are read here. This is what lets the dropdown be built the
+    // moment the section opens while the books themselves stay unread.
+    function collectOtherWorldbookNames(origins) {
+        try {
+            return (tavern.getWorldbookNames() || []).map(String).filter(name => name && !origins.has(name));
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Could not list world info books.', error);
+            return [];
+        }
+    }
+
+    function allLoadedWorldbookEntries(session) {
+        return [...session.worldbookBooks.values()].flatMap(group => group.entries);
+    }
+
+    // Selection order follows the loaded catalogue rather than the order boxes were
+    // ticked: the request should read the same way twice for the same set of entries.
+    //
+    // `missing` carries the stored { book, uid } rather than the joined key so the notice
+    // can name what is gone. It is a real case now that picks are remembered: a character
+    // card can be swapped out from under them.
+    function selectedWorldbookEntries(session) {
+        const wanted = session.worldbookSelection;
+        if (!wanted?.size) return { entries: [], missing: [] };
+        const entries = allLoadedWorldbookEntries(session).filter(entry => wanted.has(entry.key));
+        const present = new Set(entries.map(entry => entry.key));
+        const missing = [...wanted.entries()].filter(([key]) => !present.has(key)).map(([, ref]) => ref);
+        return { entries, missing };
+    }
+
+    // Written through on every tick rather than batched at close: the editor can be closed
+    // by a route that never reaches a save, and a pick that silently failed to stick is
+    // the exact annoyance this feature exists to remove.
+    function persistWorldbookSelection(session) {
+        state.settings.worldbookSelection = [...session.worldbookSelection.values()]
+            .map(ref => ({ book: ref.book, uid: ref.uid }));
+        saveSettings();
+    }
+
+    // ⚠️ A floor number only means something inside its own chat. The id is stored beside
+    // the text so that opening the editor in a different chat restores nothing at all,
+    // rather than quietly attaching whatever scene happens to sit at those numbers.
+    function persistReferenceInput(session) {
+        const chatId = currentChatId();
+        state.settings.referenceInput = session.referenceInput;
+        state.settings.referenceChatId = session.referenceInput && chatId ? chatId : '';
+        saveSettings();
+    }
+
+    function restoredReferenceInput() {
+        const chatId = currentChatId();
+        if (!chatId || state.settings.referenceChatId !== chatId) return '';
+        return state.settings.referenceInput;
+    }
+
+    async function buildReference(session) {
+        const maxId = getChatMaxMessageId();
+        const parsed = parseFloorRange(session.referenceInput, {
+            maxMessageId: maxId,
+            excludeId: session.messageId,
+        });
+        const messages = fetchFloors(parsed.ids);
+        const rules = await readTavernRegexes();
+        const selectedIds = new Set(state.settings.regexRuleIds);
+        const selected = (rules || []).filter(rule => selectedIds.has(String(rule.id)));
+        const failedRules = new Set();
+        const entries = messages.map(message => {
+            // ⚠️ `message` only. The host attaches the whole `swipes` array by default,
+            // and pulling that in would multiply a single floor several times over.
+            const role = String(message.role || '');
+            const applied = applyTavernRegexes(String(message.message ?? ''), selected, role);
+            for (const name of applied.failed) failedRules.add(name);
+            return {
+                id: Number(message.message_id),
+                name: String(message.name || ''),
+                role,
+                isHidden: Boolean(message.is_hidden),
+                text: applied.text,
+                appliedRules: applied.applied,
+            };
+        });
+        // ⚠️ The third argument is the role, and 'world_info' is what SillyTavern calls
+        // this kind of text. Leaving it out would mean "the caller does not know the
+        // role", which skips the source check and runs every checked rule — including
+        // ones written to strip things out of user input only.
+        const picked = selectedWorldbookEntries(session);
+        const worldbookEntries = picked.entries.map(entry => {
+            const applied = applyTavernRegexes(entry.content, selected, 'world_info');
+            for (const name of applied.failed) failedRules.add(name);
+            return { ...entry, content: applied.text, appliedRules: applied.applied };
+        });
+
+        const present = new Set(entries.map(entry => entry.id));
+        return {
+            parsed,
+            entries,
+            worldbook: {
+                sent: worldbookEntries.filter(entry => entry.content.length),
+                emptied: worldbookEntries.filter(entry => !entry.content.length),
+                missing: picked.missing,
+            },
+            // A rule can legitimately consume a whole floor — "old floors keep only a
+            // summary" is exactly that. Such a floor contributes nothing, so it stays
+            // out of the block; but it was asked for by number, so it still has to be
+            // accounted for on screen rather than quietly disappearing.
+            sent: entries.filter(entry => entry.text.length),
+            emptied: entries.filter(entry => !entry.text.length).map(entry => entry.id),
+            block: buildReferenceBlock(entries, worldbookEntries),
+            missing: parsed.ids.filter(id => !present.has(id)),
+            maxId,
+            rulesUnavailable: rules === null,
+            failedRules: [...failedRules],
+        };
+    }
+
+    // ══════ 編輯器介面：魔杖、視窗、參考資料 ══════
+
+    function addWands() {
+        if (state.destroyed) return;
+        for (const messageElement of hostDocument.querySelectorAll('#chat .mes[mesid]')) {
+            if (messageElement.querySelector('.stiae-wand')) continue;
+            const messageId = Number(messageElement.getAttribute('mesid'));
+            if (!Number.isInteger(messageId)) continue;
+            const message = getMessage(messageId);
+            if (!message || !['user', 'assistant'].includes(message.role)) continue;
+            // Straight into `.mes_buttons`, NOT into the `.extraMesButtons` group it
+            // used to live in: that group is `display: none` until the ⋯ is clicked,
+            // which put this tool's only entry point two clicks away. The always-visible
+            // stock buttons (checkpoint, edit) are direct children of `.mes_buttons`, and
+            // `.mes_button` styling does not depend on the parent, so moving out keeps
+            // the look. Verified against SillyTavern release `public/index.html`
+            // (`#message_template`) and `public/style.css`.
+            const actions = messageElement.querySelector('.mes_buttons');
+            if (!actions) continue;
+            const wand = createElement('div', 'mes_button stiae-wand fa-solid fa-wand-magic-sparkles');
+            wand.title = 'AI 編輯這個樓層';
+            wand.dataset.messageId = String(messageId);
+            wand.setAttribute('role', 'button');
+            wand.setAttribute('tabindex', '0');
+            // Left of the pencil, so it reads as part of the editing group. Falls back
+            // to the end of the row if a future layout drops `.mes_edit`.
+            //
+            // ⚠️ `:scope >` is load-bearing, not tidiness. A plain descendant query
+            // would also match a `.mes_edit` that had been moved *into*
+            // `.extraMesButtons`, and inserting before it would put the wand back
+            // inside the collapsed group this version exists to escape — with the
+            // append fallback never firing, so nothing would look wrong.
+            const editButton = actions.querySelector(':scope > .mes_edit');
+            if (editButton) editButton.before(wand);
+            else actions.append(wand);
+        }
+    }
+
+    function installWandObserver() {
+        let queued = false;
+        const schedule = () => {
+            if (queued) return;
+            queued = true;
+            hostWindow.requestAnimationFrame(() => {
+                queued = false;
+                addWands();
+            });
+        };
+        state.observer = new hostWindow.MutationObserver(schedule);
+        state.observer.observe(hostDocument.body, { childList: true, subtree: true });
+        addWands();
+    }
+
+    function captureEditorRect(modal) {
+        if (!modal?.isConnected || hostWindow.innerWidth <= 760) return;
+        const rect = modal.getBoundingClientRect();
+        state.settings.editorRect = {
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+        };
+        saveSettings();
+    }
+
+    function placeEditorModal(modal) {
+        const saved = state.settings.editorRect;
+        const width = Math.min(saved.width || 980, hostWindow.innerWidth - 24);
+        const height = Math.min(saved.height || 720, hostWindow.innerHeight - 24);
+        const left = saved.left == null ? (hostWindow.innerWidth - width) / 2 : Math.max(12, Math.min(saved.left, hostWindow.innerWidth - width - 12));
+        const top = saved.top == null ? (hostWindow.innerHeight - height) / 2 : Math.max(12, Math.min(saved.top, hostWindow.innerHeight - height - 12));
+        Object.assign(modal.style, { width: `${width}px`, height: `${height}px`, left: `${left}px`, top: `${top}px` });
+    }
+
+    function makeDraggable(modal, handle) {
+        let drag = null;
+        const down = event => {
+            if (hostWindow.innerWidth <= 760 || event.target.closest('button')) return;
+            const rect = modal.getBoundingClientRect();
+            drag = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+            handle.setPointerCapture?.(event.pointerId);
+        };
+        const move = event => {
+            if (!drag) return;
+            const left = Math.max(0, Math.min(drag.left + event.clientX - drag.x, hostWindow.innerWidth - modal.offsetWidth));
+            const top = Math.max(0, Math.min(drag.top + event.clientY - drag.y, hostWindow.innerHeight - modal.offsetHeight));
+            modal.style.left = `${left}px`;
+            modal.style.top = `${top}px`;
+        };
+        const up = () => { drag = null; };
+        handle.addEventListener('pointerdown', down);
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', up);
+    }
+
+    function scopeFromTextarea(textarea) {
+        const fullText = textarea.value;
+        const selectionStart = textarea.selectionStart ?? 0;
+        const selectionEnd = textarea.selectionEnd ?? selectionStart;
+        const hasSelection = selectionEnd > selectionStart;
+        const start = hasSelection ? selectionStart : 0;
+        const end = hasSelection ? selectionEnd : fullText.length;
+        return {
+            fullText,
+            start,
+            end,
+            text: fullText.slice(start, end),
+            hasSelection,
+        };
+    }
+
+    function updateScopeNotice(session) {
+        const scope = scopeFromTextarea(session.textarea);
+        session.scopeNotice.classList.toggle('is-selection', scope.hasSelection);
+        session.scopeNotice.textContent = scope.hasSelection
+            ? `已選取 ${scope.end - scope.start} 個字元：AI 只能修改這個範圍。`
+            : '未選取文字：AI 將處理整個樓層。';
+    }
+
+    // A main-thread fuse, the same kind as lcsOps' cellLimit: the echo list re-renders
+    // on every keystroke, and a range covering hundreds of floors would rebuild
+    // hundreds of rows inside the SillyTavern tab. The floors themselves are not
+    // capped — only how many of them get drawn.
+    const REFERENCE_LIST_LIMIT = 20;
+    const REFERENCE_SNIPPET_LENGTH = 40;
+    const REFERENCE_DEBOUNCE_MS = 250;
+
+    function referenceSnippet(text) {
+        const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+        return value.length > REFERENCE_SNIPPET_LENGTH ? `${value.slice(0, REFERENCE_SNIPPET_LENGTH)}…` : value;
+    }
+
+    function roleLabelOf(role) {
+        if (role === 'user') return '使用者';
+        if (role === 'assistant') return 'AI';
+        return role || '未知';
+    }
+
+    // The collapsed line states the range and the size outright. The whole point of
+    // this row is that the cost of a request is visible before the button is pressed,
+    // so "參考資料" on its own would not do the job.
+    function updateReferenceSummary(session) {
+        // Counts what actually goes out, not what was typed: a floor emptied by a regex
+        // rule would otherwise be advertised as attached when nothing of it is sent.
+        const sent = session.reference?.sent || [];
+        const books = session.reference?.worldbook?.sent || [];
+        if (!sent.length && !books.length) {
+            session.referenceSummary.textContent = '📎 參考資料：未指定';
+            return;
+        }
+        const parts = [];
+        if (sent.length) parts.push(`第 ${formatFloorRanges(sent.map(entry => entry.id))} 樓`);
+        if (books.length) parts.push(`世界書 ${books.length} 條`);
+        parts.push(`${session.reference.block.length.toLocaleString('en-US')} 字元`);
+        session.referenceSummary.textContent = `📎 參考資料：${parts.join(' · ')}`;
+    }
+
+    // Counts what actually goes out, for the same reason the outer line does: an entry a
+    // regex rule emptied would otherwise be advertised as attached.
+    //
+    // ⚠️ Says 已附加, while the chip area in the dialog says 勾選中. The two numbers are
+    // deliberately different — this one is what leaves for the model, that one is what is
+    // ticked and loaded — and an entry emptied by a regex rule makes them disagree in
+    // plain sight. Wording them alike made that read as a bug; the counts themselves are
+    // both correct and neither may be changed to match the other.
+    function updateWorldbookSummary(session) {
+        if (!session.worldbookSummary) return;
+        const books = session.reference?.worldbook?.sent || [];
+        session.worldbookSummary.textContent = books.length
+            ? `📚 世界書：已附加 ${books.length} 條 · ${books.reduce((total, entry) => total + entry.content.length, 0).toLocaleString('en-US')} 字元`
+            : '📚 世界書：未附加任何條目';
+    }
+
+    function renderReferenceDetail(session) {
+        const reference = session.reference;
+        const parsed = reference?.parsed;
+        const notes = session.referenceNotes;
+        const list = session.referenceList;
+        notes.replaceChildren();
+        list.replaceChildren();
+
+        const note = (className, text) => notes.append(createElement('div', className, text));
+
+        if (parsed?.invalid.length) {
+            note('stiae-reference-bad', `看不懂這幾段：${parsed.invalid.join('、')}。格式是「30, 42-46」。`);
+        }
+        if (parsed?.outOfRange.length) {
+            const tail = reference.maxId === null ? '' : `目前最後一樓是第 ${reference.maxId} 樓。`;
+            note('stiae-reference-bad', `超出聊天範圍：${parsed.outOfRange.join('、')}。${tail}`);
+        }
+        if (parsed?.truncated) {
+            note('stiae-reference-bad', `一次最多帶 ${RANGE_EXPANSION_LIMIT} 樓，超出的部分沒有納入。`);
+        }
+        if (reference?.missing.length) {
+            note('stiae-reference-bad', `讀不到這幾樓：第 ${formatFloorRanges(reference.missing)} 樓。`);
+        }
+        if (reference?.rulesUnavailable) {
+            note('stiae-reference-bad', '讀不到 SillyTavern 的正則規則，這次沒有套用任何規則。');
+        }
+        if (reference?.failedRules.length) {
+            note('stiae-reference-bad', `這幾條正則規則跑不起來，已跳過：${reference.failedRules.join('、')}。`);
+        }
+        if (reference?.emptied.length) {
+            note('stiae-reference-bad', `第 ${formatFloorRanges(reference.emptied)} 樓套用正則後整段變成空的，不會送出。`);
+        }
+        if (reference?.entries.length && state.settings.regexRuleIds.length && !reference.rulesUnavailable) {
+            note('stiae-help', `已套用 ${state.settings.regexRuleIds.length} 條正則規則（在設定裡挑選）。`);
+        }
+
+        // Every floor the input resolved to shows up here, including the one that was
+        // dropped. Dropping something without saying so is exactly what this project
+        // does not do.
+        const rows = [...(reference?.entries || [])];
+        if (parsed?.excluded) rows.push({ id: session.messageId, excluded: true });
+        rows.sort((a, b) => a.id - b.id);
+
+        for (const row of rows.slice(0, REFERENCE_LIST_LIMIT)) {
+            const line = createElement('div', 'stiae-ref-row');
+            line.append(createElement('strong', 'stiae-ref-id', `#${row.id}`));
+            if (row.excluded) {
+                line.classList.add('stiae-ref-excluded');
+                line.append(createElement('span', 'stiae-ref-meta', '已排除（這是你正在編輯的樓層）'));
+            } else {
+                const marks = [roleLabelOf(row.role)];
+                if (row.isHidden) marks.push('已隱藏');
+                // Rules only run on the floors they were written for, so "why didn't
+                // this one change" has to be answerable per floor, not just per rule.
+                if (state.settings.regexRuleIds.length) marks.push(`正則 ${row.appliedRules ?? 0} 條`);
+                if (!row.text.length) {
+                    marks.push('正則後為空');
+                    line.classList.add('stiae-ref-excluded');
+                }
+                line.append(createElement('span', 'stiae-ref-meta', `${row.name || '未知'} · ${marks.join(' · ')}`));
+                line.append(createElement('span', 'stiae-ref-text', referenceSnippet(row.text)));
+            }
+            list.append(line);
+        }
+        if (rows.length > REFERENCE_LIST_LIMIT) {
+            list.append(createElement('div', 'stiae-help', `…另外還有 ${rows.length - REFERENCE_LIST_LIMIT} 樓，沒有列出來，但一樣會送出。`));
+        }
+        if (!rows.length && !notes.childElementCount) {
+            list.append(createElement('div', 'stiae-help', '還沒指定任何樓層。'));
+        }
+
+        session.referenceFullText.textContent = reference?.block || '（這次沒有參考資料）';
+    }
+
+    async function refreshReference(session) {
+        hostWindow.clearTimeout(session.referenceTimer);
+        const reference = await buildReference(session);
+        // The editor may have been closed while the host was being read.
+        if (state.activeEditor !== session) return reference;
+        session.reference = reference;
+        updateReferenceSummary(session);
+        updateWorldbookSummary(session);
+        renderReferenceDetail(session);
+        // Only the parts whose text depends on what actually went out. Redrawing the
+        // whole picker here would throw away the user's scroll position and open groups
+        // every time a box is ticked.
+        renderWorldbookNotes(session);
+        renderWorldbookSelected(session);
+        return reference;
+    }
+
+    function scheduleReferenceRefresh(session) {
+        hostWindow.clearTimeout(session.referenceTimer);
+        session.referenceTimer = hostWindow.setTimeout(() => {
+            persistReferenceInput(session);
+            refreshReference(session);
+        }, REFERENCE_DEBOUNCE_MS);
+    }
+
+    // Ticking five entries in a row used to run buildReference five times, and each run
+    // re-reads the regex rules and re-applies them to every book entry.
+    //
+    // ⚠️ Deliberately NOT scheduleReferenceRefresh: that one also persists the reference
+    // floor input, which has nothing to do with world info. And only the recomputation is
+    // delayed — the tick itself, the chips, and persisting the selection all stay
+    // immediate, or the box would look like it did not register the click.
+    function scheduleWorldbookRefresh(session) {
+        hostWindow.clearTimeout(session.worldbookRefreshTimer);
+        session.worldbookRefreshTimer = hostWindow.setTimeout(() => {
+            refreshReference(session);
+        }, REFERENCE_DEBOUNCE_MS);
+    }
+
+    // Same class of fuse as REFERENCE_LIST_LIMIT and the lcsOps cellLimit: these rows are
+    // built on the whole SillyTavern tab's main thread, and a couple of hundred-entry
+    // books would freeze it. Ticked entries are exempt — losing sight of what you already
+    // chose is worse than a slightly longer list.
+    const WORLDBOOK_ROW_LIMIT = 200;
+
+    function worldbookLabel(entry) {
+        return `${entry.book} › ${entry.name || '（未命名條目）'}`;
+    }
+
+    function worldbookRow(session, entry) {
+        const label = createElement('label', 'stiae-wb-row');
+        const box = createElement('input');
+        box.type = 'checkbox';
+        box.checked = session.worldbookSelection.has(entry.key);
+        const text = createElement('div');
+        text.append(createElement('strong', '', entry.name || '（未命名條目）'));
+        text.append(createElement('div', 'stiae-help', describeWorldbookEntry(entry).join(' · ')));
+        text.append(createElement('div', 'stiae-ref-text', referenceSnippet(entry.content)));
+        box.addEventListener('change', () => {
+            if (box.checked) session.worldbookSelection.set(entry.key, { book: entry.book, uid: entry.uid });
+            else session.worldbookSelection.delete(entry.key);
+            persistWorldbookSelection(session);
+            renderWorldbookSelected(session);
+            scheduleWorldbookRefresh(session);
+        });
+        label.append(box, text);
+        return label;
+    }
+
+    // Notes are rebuilt after every refresh, which is why "emptied by a regex rule" lives
+    // here and not on the row: a row is only redrawn when the list is, and a stale mark
+    // saying an entry was dropped when it no longer is would be a lie nobody could catch.
+    function renderWorldbookNotes(session) {
+        const notes = session.worldbookNotes;
+        if (!notes) return;
+        notes.replaceChildren();
+        const note = (kind, text) => notes.append(createElement('div', kind === 'help' ? 'stiae-help' : 'stiae-reference-bad', text));
+
+        if (!worldbookApiAvailable()) {
+            note('bad', '你的酒館助手版本沒有這個功能需要的 API（getWorldbook）。更新酒館助手之後就會出現。');
+            return;
+        }
+        if (session.worldbookLoading || session.worldbookRememberedLoading) note('help', '正在讀取世界書…');
+        for (const group of session.worldbookBooks.values()) {
+            if (group.error) note('bad', `讀不到世界書「${group.book}」：${group.error}`);
+        }
+        const emptied = session.reference?.worldbook?.emptied || [];
+        if (emptied.length) {
+            note('bad', `這幾條套用正則後整段變成空的，不會送出：${emptied.map(worldbookLabel).join('、')}。`);
+        }
+        // A real case now that picks are remembered: swap the character card and its book
+        // goes with it. The picks are kept rather than pruned, so switching back restores
+        // them — but the notice has to say they are not in this request.
+        const missing = session.reference?.worldbook?.missing || [];
+        if (missing.length) {
+            const named = missing.map(ref => `${ref.book} › #${ref.uid}`).join('、');
+            note('bad', `記住的這 ${missing.length} 條在目前的聊天／角色下找不到，這次不會送出：${named}。勾選仍然留著，換回原本的角色卡就會再出現。`);
+        }
+    }
+
+    // The picker shows one book at a time, so what is already ticked in the *other* books
+    // would otherwise be invisible. These chips are the only place the whole selection can
+    // be seen and undone without navigating to each book — they carry a ✕ rather than a
+    // checkbox so the same entry can never hold two checkboxes that disagree.
+    function renderWorldbookSelected(session) {
+        const box = session.worldbookSelected;
+        if (!box) return;
+        box.replaceChildren();
+        const chosen = allLoadedWorldbookEntries(session).filter(entry => session.worldbookSelection.has(entry.key));
+        if (!chosen.length) return;
+        // 勾選中, not 已選: the editor's summary line counts what actually goes out, and a
+        // regex rule that empties an entry makes the two numbers differ. See
+        // updateWorldbookSummary().
+        box.append(createElement('div', 'stiae-help', `勾選中 ${chosen.length} 條（點 ✕ 取消）`));
+        const chips = createElement('div', 'stiae-wb-chips');
+        for (const entry of chosen) {
+            const chip = createElement('span', 'stiae-wb-chip');
+            chip.append(createElement('span', '', worldbookLabel(entry)));
+            const drop = createElement('button', 'stiae-wb-chip-x', '✕');
+            drop.type = 'button';
+            drop.title = '取消這一條';
+            drop.addEventListener('click', () => {
+                session.worldbookSelection.delete(entry.key);
+                persistWorldbookSelection(session);
+                renderWorldbookList(session);
+                scheduleWorldbookRefresh(session);
+            });
+            chip.append(drop);
+            chips.append(chip);
+        }
+        box.append(chips);
+        const clear = button('全部取消', 'fa-eraser');
+        clear.addEventListener('click', () => {
+            session.worldbookSelection.clear();
+            persistWorldbookSelection(session);
+            renderWorldbookList(session);
+            scheduleWorldbookRefresh(session);
+        });
+        box.append(clear);
+    }
+
+    function appendWorldbookRows(session, container, entries, budget) {
+        let skipped = 0;
+        for (const entry of entries) {
+            const chosen = session.worldbookSelection.has(entry.key);
+            // Ticked entries never count against the fuse and are never dropped: losing
+            // sight of what is costing tokens is worse than drawing a few more rows.
+            if (!chosen && budget.left <= 0) {
+                skipped += 1;
+                continue;
+            }
+            if (!chosen) budget.left -= 1;
+            container.append(worldbookRow(session, entry));
+        }
+        return skipped;
+    }
+
+    // Search mode. Deliberately spans every book rather than the selected one: the whole
+    // reason to search is not knowing which book an entry lives in.
+    function renderWorldbookSearch(session, container, budget) {
+        const query = session.worldbookQuery;
+        let skipped = 0;
+        let matched = 0;
+        for (const group of worldbookBookGroups(session)) {
+            const hits = filterWorldbookEntries(group.entries, query);
+            if (!hits.length) continue;
+            matched += hits.length;
+            container.append(createElement('div', 'stiae-wb-booktitle', `${group.book}（${group.origin}）· 符合 ${hits.length} 條`));
+            const list = createElement('div', 'stiae-wb-list');
+            skipped += appendWorldbookRows(session, list, hits, budget);
+            container.append(list);
+        }
+        if (!matched) {
+            container.append(createElement('div', 'stiae-help', session.worldbookAllLoaded
+                ? '所有世界書裡都沒有符合的條目。'
+                : '正在讀取全部世界書…'));
+        }
+        if (skipped) {
+            container.append(createElement('div', 'stiae-help', `…另外還有 ${skipped} 條沒有列出來，把搜尋字打得更完整一點。`));
+        }
+    }
+
+    // Browse mode: one book, chosen from the dropdown. This replaced listing every book at
+    // once, which became unusable the moment a user had more than a handful of books.
+    function renderWorldbookBook(session, container, budget) {
+        const group = session.worldbookBooks.get(session.worldbookBook);
+        if (!session.worldbookBook) {
+            container.append(createElement('div', 'stiae-help', '從上面挑一本世界書，或直接用搜尋。'));
+            return;
+        }
+        if (!group) {
+            container.append(createElement('div', 'stiae-help', '正在讀取…'));
+            return;
+        }
+        if (group.error) return;
+        if (!group.entries.length) {
+            container.append(createElement('div', 'stiae-help', '這本世界書裡沒有條目。'));
+            return;
+        }
+        const list = createElement('div', 'stiae-wb-list');
+        const skipped = appendWorldbookRows(session, list, group.entries, budget);
+        container.append(list);
+        if (skipped) {
+            container.append(createElement('div', 'stiae-help', `這本書還有 ${skipped} 條沒有列出來，用搜尋找。`));
+        }
+    }
+
+    function renderWorldbookPicker(session) {
+        const picker = session.worldbookPicker;
+        if (!picker) return;
+        picker.replaceChildren();
+        const placeholder = createElement('option', '', '選一本世界書…');
+        placeholder.value = '';
+        picker.append(placeholder);
+        const addGroup = (label, names, withOrigin) => {
+            const usable = [...names];
+            if (!usable.length) return;
+            const optgroup = createElement('optgroup');
+            optgroup.label = label;
+            for (const name of usable) {
+                const loaded = session.worldbookBooks.get(name);
+                const count = loaded && !loaded.error ? ` · ${loaded.entries.length} 條` : '';
+                const origin = withOrigin ? `（${worldbookOrigin(session, name)}）` : '';
+                const option = createElement('option', '', `${name}${origin}${count}`);
+                option.value = name;
+                optgroup.append(option);
+            }
+            picker.append(optgroup);
+        };
+        addGroup('這個聊天生效的', session.worldbookOrigins.keys(), true);
+        addGroup('其他世界書', session.worldbookOtherNames, false);
+        picker.value = session.worldbookBook;
+    }
+
+    function renderWorldbookList(session) {
+        const container = session.worldbookGroups;
+        if (!container) return;
+        renderWorldbookPicker(session);
+        container.replaceChildren();
+        const budget = { left: WORLDBOOK_ROW_LIMIT };
+        if (session.worldbookQuery.trim()) renderWorldbookSearch(session, container, budget);
+        else renderWorldbookBook(session, container, budget);
+        renderWorldbookNotes(session);
+        renderWorldbookSelected(session);
+    }
+
+    async function selectWorldbook(session, name) {
+        session.worldbookBook = name;
+        renderWorldbookList(session);
+        if (!name || !worldbookApiAvailable()) return;
+        session.worldbookLoading = true;
+        await loadWorldbooks(session, [name]);
+        if (state.activeEditor !== session) return;
+        session.worldbookLoading = false;
+        renderWorldbookList(session);
+    }
+
+    // Searching needs every book in memory, which is exactly the cost the dropdown exists
+    // to avoid — so it is paid once, only if the user actually searches, and never on
+    // simply opening the editor.
+    async function loadAllWorldbooksForSearch(session) {
+        if (session.worldbookAllLoaded || session.worldbookAllLoading || !worldbookApiAvailable()) return;
+        session.worldbookAllLoading = true;
+        renderWorldbookList(session);
+        await loadWorldbooks(session, [...session.worldbookOrigins.keys(), ...session.worldbookOtherNames]);
+        if (state.activeEditor !== session) return;
+        session.worldbookAllLoaded = true;
+        session.worldbookAllLoading = false;
+        renderWorldbookList(session);
+    }
+
+    // Opening the picker reads one book, not all of them: whichever the dropdown lands on.
+    function openWorldbookPicker(session) {
+        if (session.worldbookBook || !worldbookApiAvailable()) return;
+        const first = [...session.worldbookOrigins.keys()][0] || session.worldbookOtherNames[0] || '';
+        selectWorldbook(session, first);
+    }
+
+    // ⚠️ Runs when the editor opens, not when the picker is expanded. A remembered pick
+    // has to be in the request whether or not the user ever looks at that section — the
+    // whole point is not having to touch it. Only the books the picks actually name are
+    // read; the rest stay lazy.
+    async function loadRememberedWorldbooks(session) {
+        if (!session.worldbookSelection.size || !worldbookApiAvailable()) return;
+        const names = [...session.worldbookSelection.values()].map(ref => ref.book);
+        // ⚠️ Deliberately NOT session.worldbookLoading. That flag guards the book the
+        // dropdown is loading, and borrowing it here would let one finish and clear the
+        // other's flag, leaving a spinner that never resolves.
+        session.worldbookRememberedLoading = true;
+        await loadWorldbooks(session, names);
+        if (state.activeEditor !== session) return;
+        session.worldbookRememberedLoading = false;
+        renderWorldbookList(session);
+        await refreshReference(session);
+    }
+
+    // All the editor keeps is this line: what this request will actually cost, plus the
+    // button that opens the picker. Everything else moved into a window of its own.
+    //
+    // Inside the editor the picker was a scroller nested in a scroller, sharing what was
+    // left of a window that also has to hold the text being edited — the entries came out
+    // cramped and ran into each other. The summary stays behind because its whole purpose
+    // is being readable *without* opening anything.
+    function buildWorldbookLine(session) {
+        const line = createElement('div', 'stiae-wb-line');
+        const summary = createElement('div', 'stiae-wb-summary');
+        const open = button('選條目', 'fa-book-open');
+        open.addEventListener('click', () => openWorldbookDialog(session));
+        line.append(summary, open);
+        session.worldbookSummary = summary;
+        updateWorldbookSummary(session);
+        return line;
+    }
+
+    // The picks are saved as they are ticked, so this window has nothing to confirm and
+    // nothing to cancel — closing it is the only exit, and 完成 says so.
+    //
+    // ⚠️ It claims Escape through state.activeWorldbook. onDocumentKeydown closes the
+    // editor on Escape, so without that flag picking entries and pressing Escape would
+    // close the editor and the draft with it.
+    function openWorldbookDialog(session) {
+        if (state.activeWorldbook || state.activeEditor !== session) return;
+
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
+        const modal = createElement('section', 'stiae-settings-modal stiae-wb-modal');
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        const header = createElement('header', 'stiae-header');
+        header.append(createElement('strong', '', `世界書條目 · 第 ${session.messageId} 樓`));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        close.title = '完成';
+        header.append(close);
+
+        const body = createElement('div', 'stiae-wb-body');
+        const searchRow = createElement('div', 'stiae-reference-row');
+        const search = createElement('input', 'stiae-reference-input');
+        search.type = 'text';
+        search.placeholder = '搜尋全部世界書（條目名、書名或關鍵字）';
+        search.value = session.worldbookQuery;
+        const clearSearch = button('清除', 'fa-eraser');
+        searchRow.append(search, clearSearch);
+
+        const pickerRow = createElement('div', 'stiae-reference-row');
+        const picker = createElement('select', 'stiae-wb-picker');
+        pickerRow.append(picker);
+
+        const help = createElement(
+            'div',
+            'stiae-help',
+            '一次挑一本，勾好再換下一本。搜尋會跨全部世界書（第一次要多等一下）。唯讀、會記住，關掉這個視窗就生效。',
+        );
+        const notes = createElement('div', 'stiae-reference-notes');
+        const selected = createElement('div', 'stiae-wb-selected');
+        const groups = createElement('div', 'stiae-wb-groups');
+        body.append(searchRow, pickerRow, help, notes, selected, groups);
+
+        const footer = createElement('footer', 'stiae-footer');
+        const done = button('完成', 'fa-check', 'stiae-primary');
+        footer.append(done);
+
+        modal.append(header, body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+
+        session.worldbookNotes = notes;
+        session.worldbookSelected = selected;
+        session.worldbookGroups = groups;
+        session.worldbookPicker = picker;
+        state.activeWorldbook = overlay;
+
+        const dismiss = () => {
+            if (state.activeWorldbook !== overlay) return;
+            state.activeWorldbook = null;
+            hostDocument.removeEventListener('keydown', onKey, true);
+            hostWindow.clearTimeout(session.worldbookTimer);
+            overlay.remove();
+            // These nodes leave the document with the dialog. Dropping the references
+            // makes every render function above no-op on its own guard clause instead of
+            // quietly painting into a detached tree.
+            session.worldbookNotes = null;
+            session.worldbookSelected = null;
+            session.worldbookGroups = null;
+            session.worldbookPicker = null;
+            // Anything still on the debounce lands now, so the summary line the editor
+            // shows can never be one tick behind what was ticked.
+            refreshReference(session);
+        };
+        function onKey(event) {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            event.stopPropagation();
+            dismiss();
+        }
+
+        close.addEventListener('click', dismiss);
+        done.addEventListener('click', dismiss);
+        overlay.addEventListener('mousedown', event => {
+            if (event.target === overlay) dismiss();
+        });
+        hostDocument.addEventListener('keydown', onKey, true);
+
+        picker.addEventListener('change', () => {
+            // Picking a book is a browse action, so it also drops out of search mode —
+            // otherwise the dropdown would visibly change while the list ignored it.
+            search.value = '';
+            session.worldbookQuery = '';
+            selectWorldbook(session, picker.value);
+        });
+        search.addEventListener('input', () => {
+            hostWindow.clearTimeout(session.worldbookTimer);
+            session.worldbookTimer = hostWindow.setTimeout(() => {
+                session.worldbookQuery = search.value;
+                renderWorldbookList(session);
+                if (session.worldbookQuery.trim()) loadAllWorldbooksForSearch(session);
+            }, REFERENCE_DEBOUNCE_MS);
+        });
+        clearSearch.addEventListener('click', () => {
+            search.value = '';
+            session.worldbookQuery = '';
+            renderWorldbookList(session);
+        });
+
+        renderWorldbookList(session);
+        openWorldbookPicker(session);
+        search.focus();
+    }
+
+    function buildReferenceSection(session) {
+        const details = createElement('details', 'stiae-reference');
+        const summary = createElement('summary', 'stiae-reference-summary');
+        const body = createElement('div', 'stiae-reference-body');
+
+        const row = createElement('div', 'stiae-reference-row');
+        const input = createElement('input', 'stiae-reference-input');
+        input.type = 'text';
+        input.placeholder = '例如：30, 42-46';
+        input.value = session.referenceInput;
+        const quickFive = button('前 5 樓', 'fa-backward');
+        const quickTen = button('前 10 樓', 'fa-backward-fast');
+        const clear = button('清除', 'fa-eraser');
+        row.append(input, quickFive, quickTen, clear);
+
+        const help = createElement(
+            'div',
+            'stiae-help',
+            '唯讀，不會被寫回聊天。會記住；換到別的聊天就清空。',
+        );
+        const notes = createElement('div', 'stiae-reference-notes');
+        const list = createElement('div', 'stiae-reference-list');
+        const full = createElement('details', 'stiae-reference-full');
+        full.append(createElement('summary', '', '查看送出的完整參考資料'));
+        const fullText = createElement('pre', 'stiae-reference-pre');
+        full.append(fullText);
+
+        body.append(row, help, notes, list, buildWorldbookLine(session), full);
+        details.append(summary, body);
+
+        session.referenceSummary = summary;
+        session.referenceNotes = notes;
+        session.referenceList = list;
+        session.referenceFullText = fullText;
+
+        // The quick buttons only type for you — the text box stays the single source
+        // of truth. That is what keeps "前 5 樓" from being ambiguous: the answer is
+        // spelled out as 42-46 the moment you press it, counted back from the floor
+        // being edited rather than from the end of the chat.
+        const fillRecent = count => {
+            const to = session.messageId - 1;
+            const from = Math.max(0, session.messageId - count);
+            if (to < from) {
+                toast('info', '這一樓前面沒有其他樓層。');
+                return;
+            }
+            input.value = from === to ? String(from) : `${from}-${to}`;
+            session.referenceInput = input.value;
+            persistReferenceInput(session);
+            details.open = true;
+            refreshReference(session);
+        };
+
+        input.addEventListener('input', () => {
+            session.referenceInput = input.value;
+            // Saved on the same debounce as the refresh rather than per keystroke: this
+            // writes the whole settings table through the host each time.
+            scheduleReferenceRefresh(session);
+        });
+        quickFive.addEventListener('click', () => fillRecent(5));
+        quickTen.addEventListener('click', () => fillRecent(10));
+        clear.addEventListener('click', () => {
+            input.value = '';
+            session.referenceInput = '';
+            persistReferenceInput(session);
+            refreshReference(session);
+        });
+
+        return details;
+    }
+
+    // Replaces window.confirm(), which cannot be relied on here.
+    //
+    // ⚠️ The script runs inside a TavernHelper iframe. When that iframe is sandboxed
+    // without `allow-modals`, the browser does not merely refuse the dialog — it
+    // returns `false` and says nothing. Every `if (!confirm(...)) return;` then became
+    // a silent no-op: the floor could not be saved, and an editor with an unsaved
+    // draft could not even be closed. Nothing was logged and no message was shown,
+    // because from the code's point of view the user had simply clicked "cancel".
+    //
+    // This dialog is drawn by the tool itself, so it cannot be taken away by a sandbox
+    // flag or a browser policy change. The two-stage save (accept only updates the
+    // draft; writing back needs a second confirmation) is unchanged — only the kind of
+    // window it uses.
+    function showConfirm(message, { confirmLabel = '確定', danger = false } = {}) {
+        // One at a time. Without this, a double click on 儲存樓層 would stack two.
+        if (state.activeConfirm) return Promise.resolve(false);
+        return new Promise(resolve => {
+            const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-confirm-layer`);
+            const modal = createElement('section', 'stiae-confirm-modal');
+            modal.setAttribute('role', 'alertdialog');
+            modal.setAttribute('aria-modal', 'true');
+            const text = createElement('div', 'stiae-confirm-text', message);
+            const footer = createElement('footer', 'stiae-footer');
+            const cancel = button('取消', 'fa-xmark');
+            const accept = button(confirmLabel, 'fa-check', danger ? 'stiae-danger' : 'stiae-primary');
+            footer.append(cancel, accept);
+            modal.append(text, footer);
+            overlay.append(modal);
+            hostDocument.body.append(overlay);
+
+            const finish = value => {
+                if (state.activeConfirm !== overlay) return;
+                state.activeConfirm = null;
+                hostDocument.removeEventListener('keydown', onKey, true);
+                overlay.remove();
+                resolve(value);
+            };
+            function onKey(event) {
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    finish(false);
+                } else if (event.key === 'Enter') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    finish(true);
+                }
+            }
+            state.activeConfirm = overlay;
+            cancel.addEventListener('click', () => finish(false));
+            accept.addEventListener('click', () => finish(true));
+            // Clicking the backdrop cancels, matching every other dialog here. It never
+            // confirms — an accidental click must not write to the chat.
+            overlay.addEventListener('mousedown', event => {
+                if (event.target === overlay) finish(false);
+            });
+            hostDocument.addEventListener('keydown', onKey, true);
+            accept.focus();
+        });
+    }
+
+    function closeDetailsMenus(container) {
+        for (const detail of container.querySelectorAll('details[open]')) detail.removeAttribute('open');
+    }
+
+    function renderEditorToolbar(session) {
+        const toolbar = session.toolbar;
+        toolbar.replaceChildren();
+
+        const { builtins, customs } = resolveCommands(state.settings);
+        for (const action of builtins.filter(command => command.visible && command.instruction.trim())) {
+            const item = button(action.name, action.icon);
+            item.addEventListener('click', () => runAiAction(session, action));
+            toolbar.append(item);
+        }
+
+        const visibleCommands = customs.filter(command => command.visible && command.instruction.trim());
+        const pinned = visibleCommands.slice(0, 3);
+        for (const command of pinned) {
+            const item = button(command.name, command.icon, 'stiae-desktop-pin');
+            item.addEventListener('click', () => runAiAction(session, command));
+            toolbar.append(item);
+        }
+
+        if (visibleCommands.length) {
+            const more = createElement('details', 'stiae-more');
+            const summary = createElement('summary', 'menu_button stiae-button');
+            summary.append(createElement('i', 'fa-solid fa-ellipsis'));
+            summary.append(createElement('span', '', '更多'));
+            const menu = createElement('div', 'stiae-menu');
+            const grouped = commandGroupNames(visibleCommands).length > 0;
+            // On desktop the first three are hidden in this menu because they are already
+            // pinned to the toolbar. A group made up entirely of those would leave its
+            // heading standing over nothing, so such a heading is mobile-only too.
+            const groupShowsOnDesktop = new Set();
+            visibleCommands.forEach((command, index) => {
+                if (index >= 3) groupShowsOnDesktop.add(command.group || '');
+            });
+            let lastGroup = null;
+            visibleCommands.forEach((command, index) => {
+                const group = command.group || '';
+                if (grouped && group !== lastGroup) {
+                    const heading = createElement(
+                        'div',
+                        `stiae-menu-group${groupShowsOnDesktop.has(group) ? '' : ' stiae-menu-group-mobile'}`,
+                        group || '未分組',
+                    );
+                    menu.append(heading);
+                }
+                lastGroup = group;
+                // ⚠️ index is the position in the whole visible list, never within the
+                // group. The first three commands are rendered twice — as pinned buttons
+                // and as menu items — and .stiae-desktop-pin / .stiae-mobile-menu-item
+                // hide one copy each by media query. Counting per group here would pin
+                // the wrong ones and show duplicates on desktop.
+                const classes = index < 3 ? 'stiae-mobile-menu-item' : '';
+                const item = button(command.name, command.icon, classes);
+                item.addEventListener('click', () => {
+                    more.removeAttribute('open');
+                    runAiAction(session, command);
+                });
+                menu.append(item);
+            });
+            more.append(summary, menu);
+            toolbar.append(more);
+        }
+
+        const custom = button('臨時指令', 'fa-comment-dots');
+        custom.addEventListener('click', async () => {
+            const action = await showOneOffCommand(session);
+            if (action) runAiAction(session, action);
+        });
+        toolbar.append(custom);
+
+        toolbar.append(createElement('div', 'stiae-toolbar-spacer'));
+        const settingsButton = button('設定', 'fa-gear', 'stiae-icon-button');
+        settingsButton.title = 'AI 內文編輯器設定';
+        settingsButton.addEventListener('click', () => openSettings());
+        toolbar.append(settingsButton);
+        session.settingsButton = settingsButton;
+        markToolbarUpdateBadge(session);
+    }
+
+    // ══════ 編輯器行為：開啟、儲存、關閉 ══════
+
+    async function requestCloseEditor(session, force = false) {
+        if (!session || state.activeEditor !== session) return true;
+        session.draft = session.textarea.value;
+        if (!force && session.draft !== session.baseText) {
+            const confirmed = await showConfirm('這個樓層有尚未儲存的修改。要捨棄草稿嗎？', { confirmLabel: '捨棄草稿', danger: true });
+            if (!confirmed) return false;
+            // The editor may have been closed or replaced while the dialog was up.
+            if (state.activeEditor !== session) return true;
+        }
+        hostWindow.clearTimeout(session.referenceTimer);
+        hostWindow.clearTimeout(session.worldbookTimer);
+        hostWindow.clearTimeout(session.worldbookRefreshTimer);
+        // The picker belongs to this editor. Left open it would go on ticking entries
+        // into a session that no longer has anywhere to send them.
+        state.activeWorldbook?.remove();
+        state.activeWorldbook = null;
+        captureEditorRect(session.modal);
+        session.overlay.remove();
+        state.activeEditor = null;
+        return true;
+    }
+
+    async function saveEditor(session) {
+        const draft = session.textarea.value;
+        if (draft === session.baseText) {
+            toast('info', '樓層內容沒有變更。');
+            requestCloseEditor(session, true);
+            return;
+        }
+
+        const current = getMessage(session.messageId);
+        const swiped = getMessage(session.messageId, true);
+        const currentSwipeId = Number.isInteger(swiped?.swipe_id) ? swiped.swipe_id : 0;
+        if (!current || current.message !== session.baseText || currentSwipeId !== session.swipeId) {
+            toast('error', '這個樓層或目前 swipe 已在外部變更。請關閉編輯器後重新開啟，避免覆蓋新內容。');
+            session.scopeNotice.textContent = '偵測到外部變更：目前禁止儲存。';
+            session.scopeNotice.classList.add('is-selection');
+            return;
+        }
+
+        // ⚠️ This sentence is the only place that unconditionally names the write
+        // target. The optimistic lock above only catches a swipe that changed *after*
+        // the editor opened; a user who was already sitting on the wrong swipe passes
+        // it silently. The two guard different things — do not fold them together.
+        const confirmed = await showConfirm(
+            `確定要把草稿寫入第 ${session.messageId} 樓目前顯示的 swipe 嗎？`,
+            { confirmLabel: '寫入樓層' },
+        );
+        if (!confirmed) return;
+        // The dialog is not instant, so re-check that this editor is still the live one.
+        if (state.activeEditor !== session) return;
+
+        try {
+            await tavern.setChatMessages([{ message_id: session.messageId, message: draft }], { refresh: 'affected' });
+            session.baseText = draft;
+            session.draft = draft;
+            toast('success', `第 ${session.messageId} 樓已更新。`);
+            requestCloseEditor(session, true);
+        } catch (error) {
+            console.error('[ST Inline AI Editor] Failed to save message.', error);
+            toast('error', '寫入樓層失敗，草稿仍保留在編輯器中。');
+        }
+    }
+
+    async function openEditor(messageId) {
+        if (state.activeEditor) {
+            if (state.activeEditor.messageId === messageId) return;
+            if (!(await requestCloseEditor(state.activeEditor))) return;
+        }
+
+        const message = getMessage(messageId);
+        const swiped = getMessage(messageId, true);
+        if (!message || !['user', 'assistant'].includes(message.role)) {
+            toast('warning', '這個樓層不是可編輯的使用者或 AI 訊息。');
+            return;
+        }
+
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay`);
+        const modal = createElement('section', 'stiae-modal');
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        const header = createElement('header', 'stiae-header');
+        const swipeId = Number.isInteger(swiped?.swipe_id) ? swiped.swipe_id : 0;
+        const roleLabel = message.role === 'user' ? '使用者' : 'AI';
+        header.append(createElement('strong', '', `AI 內文編輯器 · 第 ${messageId} 樓 · ${roleLabel} · Swipe ${swipeId + 1}`));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        close.title = '關閉';
+        header.append(close);
+        const toolbar = createElement('div', 'stiae-toolbar');
+        const scopeNotice = createElement('div', 'stiae-scope');
+        const body = createElement('div', 'stiae-editor-body');
+        const textarea = createElement('textarea', 'stiae-editor-text');
+        textarea.value = message.message;
+        textarea.spellcheck = false;
+        body.append(textarea);
+        const footer = createElement('footer', 'stiae-footer');
+        const cancel = button('取消', 'fa-xmark');
+        const save = button('儲存樓層', 'fa-check', 'stiae-primary');
+        footer.append(cancel, save);
+
+        const session = {
+            messageId: Number(messageId),
+            swipeId,
+            role: message.role,
+            name: message.name,
+            baseText: message.message,
+            draft: message.message,
+            overlay,
+            modal,
+            toolbar,
+            scopeNotice,
+            textarea,
+            // Reference material lives and dies with this editor, exactly like the
+            // draft and the selection.
+            // Restored only when the stored chat id matches this chat — see
+            // restoredReferenceInput(). Everything else about the reference material is
+            // unchanged: it is read-only and never written back.
+            referenceInput: restoredReferenceInput(),
+            reference: null,
+            referenceTimer: null,
+            // World info picks are remembered across editors, so they start populated.
+            // The catalogue does not: books are read on demand, and the `*Loaded` flags
+            // rather than the map's emptiness say whether a group has been fetched.
+            worldbookSelection: new Map(state.settings.worldbookSelection
+                .map(ref => [worldbookEntryKey(ref.book, ref.uid), ref])),
+            worldbookOrigins: worldbookApiAvailable() ? collectActiveWorldbooks() : new Map(),
+            worldbookOtherNames: [],
+            worldbookBooks: new Map(),
+            worldbookBook: '',
+            worldbookAllLoaded: false,
+            worldbookAllLoading: false,
+            worldbookLoading: false,
+            worldbookRememberedLoading: false,
+            worldbookQuery: '',
+            worldbookTimer: null,
+            worldbookRefreshTimer: null,
+            // Kept only for this editor's lifetime so re-opening "臨時指令" after a run
+            // starts pre-filled instead of blank. Not persisted to settings — a fresh
+            // editor on a different floor (or reopening this one) starts empty again.
+            oneOffInstruction: '',
+        };
+        session.worldbookOtherNames = worldbookApiAvailable()
+            ? collectOtherWorldbookNames(session.worldbookOrigins)
+            : [];
+        state.activeEditor = session;
+
+        modal.append(header, toolbar, scopeNotice, buildReferenceSection(session), body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+        placeEditorModal(modal);
+        makeDraggable(modal, header);
+
+        renderEditorToolbar(session);
+        updateScopeNotice(session);
+        refreshReference(session);
+        // Reads only the books the remembered picks name, and refreshes again once they
+        // land. Without this a remembered pick would sit in the summary line but be
+        // absent from the request until the user happened to expand the picker.
+        loadRememberedWorldbooks(session);
+
+        textarea.addEventListener('input', () => { session.draft = textarea.value; });
+        for (const eventName of ['select', 'keyup', 'mouseup', 'touchend']) {
+            textarea.addEventListener(eventName, () => updateScopeNotice(session));
+        }
+        close.addEventListener('click', () => requestCloseEditor(session));
+        cancel.addEventListener('click', () => requestCloseEditor(session));
+        save.addEventListener('click', () => saveEditor(session));
+        overlay.addEventListener('mousedown', event => {
+            if (event.target === overlay) requestCloseEditor(session);
+        });
+        textarea.focus();
+    }
+
+    function resolveProfile(action) {
+        const profileId = action.profileId || state.settings.defaultProfileId;
+        const expectedProfileName = action.profileId ? action.profileName : state.settings.defaultProfileName;
+        if (!profileId) throw new Error('尚未選擇 AI 內文編輯器的 Connection Profile。');
+        const context = getContext();
+        const service = context?.ConnectionManagerRequestService;
+        if (!service) throw new Error('目前 SillyTavern 未提供 Connection Profile 請求服務。請確認版本至少為 1.18.0。');
+        const profile = service.getProfile(profileId);
+        service.validateProfile(profile);
+        if (expectedProfileName && profile.name !== expectedProfileName) {
+            throw new Error(`Connection Profile「${expectedProfileName}」已被重新命名。請在設定中重新選擇。`);
+        }
+        return { profileId, profile, service };
+    }
+
+    // ══════ 差異視窗與審核流程 ══════
+
+    function paintWordDiff(container, ops, side) {
+        let appended = false;
+        for (const op of ops) {
+            if (op.type === 'equal' || (side === 'original' && op.type === 'remove') || (side === 'proposed' && op.type === 'add')) {
+                const span = createElement('span', op.type === 'remove' ? 'stiae-word-removed' : op.type === 'add' ? 'stiae-word-added' : '');
+                span.textContent = op.value;
+                container.append(span);
+                appended = true;
+            }
+        }
+        if (!appended) container.append(hostDocument.createTextNode(' '));
+    }
+
+    // Both sides of a row are painted from ONE op list. They differ only in which ops
+    // they keep, so running the word-level LCS once per side would pay the same DP
+    // twice for an identical result — and that DP runs on the SillyTavern tab's main
+    // thread, which is why lcsOps carries a cell limit at all.
+    function buildDiffRowCells(row) {
+        const original = createElement('div', 'stiae-diff-cell original');
+        const proposed = createElement('div', 'stiae-diff-cell proposed');
+        if (row.type === 'equal') {
+            original.textContent = row.original;
+            proposed.textContent = row.proposed;
+            return [original, proposed];
+        }
+        const ops = lcsOps(tokenizeForDiff(row.original), tokenizeForDiff(row.proposed), (a, b) => a === b, 80000);
+        if (row.addOnly) {
+            original.classList.add('stiae-diff-empty');
+            original.textContent = ' ';
+        } else {
+            original.classList.add('removed');
+            paintWordDiff(original, ops, 'original');
+        }
+        if (row.removeOnly) {
+            proposed.classList.add('stiae-diff-empty');
+            proposed.textContent = ' ';
+        } else {
+            proposed.classList.add('added');
+            paintWordDiff(proposed, ops, 'proposed');
+        }
+        return [original, proposed];
+    }
+
+    // A row-major grid rather than two independently built columns. Two things need
+    // the sides to share a grid row: the checkbox in the left gutter has to stay level
+    // with the change it governs, and the two sides no longer drift apart when a long
+    // line wraps to a different height on one side only.
+    //
+    // Takes rows rather than the two texts: the interactive caller already holds the
+    // rows it composes from, and letting it pass texts *as well* would allow a view
+    // that renders one diff while the accept button writes another.
+    //
+    // `selection` is optional — without it there is no gutter and no checkboxes, which
+    // is what the read-only full-floor preview wants.
+    function buildDiffView(rows, options = {}) {
+        const { selection = null, onChange = null } = options;
+        const wrapper = createElement('div');
+        const grid = createElement('div', `stiae-diff-grid${selection ? ' stiae-has-gate' : ''}`);
+        grid.dataset.active = 'proposed';
+        if (selection) grid.append(createElement('div', 'stiae-diff-title stiae-diff-gate', '採用'));
+        grid.append(
+            createElement('div', 'stiae-diff-title original', '原文'),
+            createElement('div', 'stiae-diff-title proposed', '修改後'),
+        );
+        rows.forEach((row, index) => {
+            const cells = buildDiffRowCells(row);
+            // One checkbox per changed row, so a row carrying two patches is governed
+            // as one decision. That is the deliberate trade for applying the patches
+            // exactly once — see composeSelectedRows.
+            if (selection) {
+                const gate = createElement('div', 'stiae-diff-gate');
+                cells.unshift(gate);
+                if (row.type !== 'equal') {
+                    const box = createElement('input', 'stiae-diff-checkbox');
+                    box.type = 'checkbox';
+                    box.checked = selection[index] !== false;
+                    box.title = '取消勾選就保留這一行的原文';
+                    const paint = () => cells.forEach(cell => cell.classList.toggle('stiae-diff-off', !box.checked));
+                    box.addEventListener('change', () => {
+                        selection[index] = box.checked;
+                        paint();
+                        onChange?.();
+                    });
+                    gate.append(box);
+                    paint();
+                }
+            }
+            grid.append(...cells);
+        });
+        // Always built. The stylesheet shows them only on a narrow screen, where one
+        // side has to be hidden for anything to be readable — including in the
+        // read-only preview, which previously had no way to switch and so rendered
+        // both sides interleaved line by line under two stacked headers.
+        const tabs = createElement('div', 'stiae-diff-tabs');
+        const originalTab = button('原文');
+        const proposedTab = button('修改後', '', 'stiae-primary');
+        originalTab.addEventListener('click', () => {
+            grid.dataset.active = 'original';
+            originalTab.classList.add('stiae-primary');
+            proposedTab.classList.remove('stiae-primary');
+        });
+        proposedTab.addEventListener('click', () => {
+            grid.dataset.active = 'proposed';
+            proposedTab.classList.add('stiae-primary');
+            originalTab.classList.remove('stiae-primary');
+        });
+        tabs.append(originalTab, proposedTab);
+        wrapper.append(tabs, grid);
+        return wrapper;
+    }
+
+    // Answers a different question from the editor's own reference panel. That one is
+    // "what am I about to pay for"; this one is "the result looks wrong — what did the
+    // model actually see". The full request only exists once a command has been
+    // pressed, because only then is the instruction, the editing principles and the
+    // protocol known, which is why it cannot live in the editor.
+    //
+    // ⚠️ Collapsed, never a gate, and it must stay inside the modal. The review dialog
+    // covers the screen because scope.start / scope.end were frozen before the request
+    // went out; letting this grow into a side panel over a usable textarea would let
+    // those offsets go stale and land the result in the wrong place.
+    function buildRequestPreview(messages) {
+        const rows = messages || [];
+        const size = rows.reduce((total, message) => total + String(message?.content ?? '').length, 0);
+        const details = createElement('details', 'stiae-request-preview');
+        details.append(createElement('summary', '', `查看這次送出的完整請求（${size.toLocaleString('en-US')} 字元）`));
+        for (const message of rows) {
+            details.append(createElement('div', 'stiae-request-role', message.role === 'system' ? '系統訊息（協定與編輯原則）' : '使用者訊息（指示與內容）'));
+            details.append(createElement('pre', 'stiae-request-body', String(message?.content ?? '')));
+        }
+        return details;
+    }
+
+    function createReviewDialog(action, scope, messages) {
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-review-layer`);
+        const modal = createElement('section', 'stiae-modal stiae-review-modal');
+        const header = createElement('header', 'stiae-header');
+        header.append(createElement('strong', '', `檢查修改 · ${action.name}`));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        header.append(close);
+        const body = createElement('div', 'stiae-review-body');
+        const status = createElement('div', 'stiae-status');
+        const warnings = createElement('div');
+        const content = createElement('div');
+        // Built once and left in place: regenerating reuses the same request, and the
+        // three view states below only ever replace `warnings` and `content`.
+        body.append(status, buildRequestPreview(messages), warnings, content);
+        const footer = createElement('footer', 'stiae-footer');
+        const copyRaw = button('複製原始輸出', 'fa-copy');
+        const stop = button('停止', 'fa-stop', 'stiae-danger');
+        const reject = button('拒絕', 'fa-xmark');
+        const regenerate = button('重新生成', 'fa-rotate-right');
+        const accept = button('接受修改', 'fa-check', 'stiae-primary');
+        footer.append(copyRaw, stop, reject, regenerate, accept);
+        modal.append(header, body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+
+        let resolver = null;
+        let pendingAction = null;
+        let rawText = '';
+        let stopHandler = null;
+        let closed = false;
+        let selection = [];
+        let resultText = '';
+
+        const emit = actionName => {
+            if (!resolver) {
+                pendingAction = actionName;
+                return;
+            }
+            const resolve = resolver;
+            resolver = null;
+            resolve(actionName);
+        };
+
+        // The diff rows are computed once, from the result of applying every patch,
+        // and never recomputed while the user ticks. That is the whole point of
+        // selecting at the row layer: the patches have already run, so no tick can
+        // change whether one of them matched. Only the composed text, the counter and
+        // the accept button move.
+        let diffRows = [];
+        let changedCount = 0;
+        let previewBody = null;
+        let previewStale = true;
+        // Survives renderResult, which builds a fresh <details> per generation. Without
+        // it, hitting 重新生成 collapses a preview the user had deliberately opened —
+        // exactly when they want to see the new result in context.
+        let previewOpen = false;
+
+        const renderPreview = () => {
+            if (!previewBody) return;
+            previewBody.replaceChildren(buildDiffView(
+                computeDiffRows(scope.fullText, applyScope(scope.fullText, scope.start, scope.end, resultText)),
+            ));
+            previewStale = false;
+        };
+
+        // Runs on every tick, so it does the least it can. It does not touch the diff
+        // grid — the rows are unchanged and buildDiffView repaints the ticked row's own
+        // cells — and it only marks the full-floor preview dirty. Rebuilding that
+        // eagerly would run a whole-message LCS per click, including while the
+        // <details> is collapsed and nobody can see it.
+        const refreshComposed = () => {
+            resultText = composeSelectedRows(diffRows, selection);
+            const kept = selection.filter(Boolean).length;
+            status.textContent = changedCount
+                ? `共 ${changedCount} 處變更，已採用 ${kept} 處。`
+                : '模型沒有改動任何內容。';
+            accept.classList.toggle('stiae-hidden', resultText === scope.text);
+            previewStale = true;
+            if (previewBody?.parentElement?.open) renderPreview();
+        };
+
+        const renderResult = parsed => {
+            diffRows = computeDiffRows(scope.text, parsed.text);
+            // Every changed row starts ticked: the model was asked for these, so the
+            // user's job is to veto, not to opt in one at a time. Equal rows stay
+            // false, which is what lets `kept` above be a plain truthy count.
+            selection = diffRows.map(row => row.type !== 'equal');
+            changedCount = selection.filter(Boolean).length;
+            // Warnings describe what the model returned, not what is ticked, so they
+            // are written once and left alone.
+            warnings.replaceChildren();
+            for (const warningText of parsed.warnings) warnings.append(createElement('div', 'stiae-warning', warningText));
+            content.replaceChildren(buildDiffView(diffRows, { selection, onChange: refreshComposed }));
+            previewBody = null;
+            if (scope.hasSelection) {
+                const details = createElement('details', 'stiae-full-preview');
+                details.append(createElement('summary', '', '查看整個樓層的修改位置'));
+                previewBody = createElement('div');
+                details.append(previewBody);
+                details.addEventListener('toggle', () => {
+                    previewOpen = details.open;
+                    if (details.open && previewStale) renderPreview();
+                });
+                details.open = previewOpen;
+                content.append(details);
+            }
+            refreshComposed();
+        };
+
+        const api = {
+            setStopHandler(handler) { stopHandler = handler; },
+            waitAction() {
+                if (pendingAction) {
+                    const actionName = pendingAction;
+                    pendingAction = null;
+                    return Promise.resolve(actionName);
+                }
+                return new Promise(resolve => { resolver = resolve; });
+            },
+            showGenerating() {
+                rawText = '';
+                status.textContent = '正在生成；完成後才會建立差異。';
+                warnings.replaceChildren();
+                const stream = createElement('pre', 'stiae-stream', '等待模型輸出…');
+                content.replaceChildren(stream);
+                api.streamElement = stream;
+                stop.classList.remove('stiae-hidden');
+                copyRaw.classList.add('stiae-hidden');
+                regenerate.classList.add('stiae-hidden');
+                accept.classList.add('stiae-hidden');
+            },
+            updateStream(text) {
+                rawText = String(text ?? '');
+                if (api.streamElement) api.streamElement.textContent = rawText || '等待模型輸出…';
+            },
+            showResult(parsed) {
+                rawText = parsed.raw;
+                renderResult(parsed);
+                stop.classList.add('stiae-hidden');
+                copyRaw.classList.remove('stiae-hidden');
+                regenerate.classList.remove('stiae-hidden');
+            },
+            resultText() { return resultText; },
+            showError(message, stopped = false) {
+                status.textContent = stopped ? '生成已停止。已產生的文字只供複製，不能套用。' : '生成失敗。';
+                warnings.replaceChildren(createElement('div', 'stiae-warning', message));
+                if (!rawText) content.replaceChildren(createElement('pre', 'stiae-stream', '沒有可用輸出。'));
+                stop.classList.add('stiae-hidden');
+                copyRaw.classList.toggle('stiae-hidden', !rawText);
+                regenerate.classList.remove('stiae-hidden');
+                accept.classList.add('stiae-hidden');
+            },
+            close() {
+                if (closed) return;
+                closed = true;
+                overlay.remove();
+                if (state.activeReview === api) state.activeReview = null;
+            },
+        };
+
+        copyRaw.addEventListener('click', async () => {
+            try {
+                await hostWindow.navigator.clipboard.writeText(rawText);
+                toast('success', '已複製模型原始輸出。');
+            } catch {
+                tavern.builtin?.copyText?.(rawText);
+            }
+        });
+        stop.addEventListener('click', () => stopHandler?.());
+        reject.addEventListener('click', () => emit('reject'));
+        regenerate.addEventListener('click', () => emit('regenerate'));
+        accept.addEventListener('click', () => emit('accept'));
+        close.addEventListener('click', () => {
+            stopHandler?.();
+            emit('reject');
+        });
+        state.activeReview = api;
+        return api;
+    }
+
+    async function generateWithProfile(request, dialog) {
+        const abortController = new hostWindow.AbortController();
+        let stopped = false;
+        dialog.setStopHandler(() => {
+            stopped = true;
+            abortController.abort();
+        });
+        const streamResponse = await request.service.sendRequest(
+            request.profileId,
+            request.messages,
+            request.maxTokens,
+            {
+                extractData: true,
+                includePreset: true,
+                stream: true,
+                signal: abortController.signal,
+            },
+        );
+        let finalText = '';
+        if (typeof streamResponse === 'function') {
+            const generator = streamResponse();
+            for await (const chunk of generator) {
+                finalText = String(chunk?.text ?? finalText);
+                dialog.updateStream(finalText);
+            }
+        } else {
+            finalText = String(streamResponse?.content ?? '');
+            dialog.updateStream(finalText);
+        }
+        return { text: finalText, stopped };
+    }
+
+    async function runAiAction(session, actionInput) {
+        if (!session || state.activeEditor !== session || state.activeReview) return;
+        closeDetailsMenus(session.toolbar);
+        const action = {
+            ...actionInput,
+            mode: actionInput.mode === 'replacement' ? 'replacement' : 'patch',
+            systemPrompt: actionInput.systemPrompt || '',
+            profileId: actionInput.profileId || '',
+        };
+        const scope = scopeFromTextarea(session.textarea);
+        if (!scope.text.length) {
+            toast('warning', '可編輯範圍是空的。');
+            return;
+        }
+
+        let connection;
+        try {
+            connection = resolveProfile(action);
+        } catch (error) {
+            toast('error', error.message || 'Connection Profile 無法使用，請重新選擇。');
+            openSettings(true);
+            return;
+        }
+
+        // Rebuilt here rather than read off the session: the echo list is debounced, so
+        // a command pressed straight after typing would otherwise send the previous
+        // range. What goes out has to match what the user just looked at.
+        const reference = await refreshReference(session);
+        if (state.activeEditor !== session || state.activeReview) return;
+
+        const request = {
+            ...connection,
+            messages: buildPrompt(action, scope, session.role, {
+                referenceBlock: reference.block,
+                globalPrompt: state.settings.globalPrompt,
+            }),
+            maxTokens: action.maxTokens || state.settings.defaultMaxTokens,
+        };
+        const dialog = createReviewDialog(action, scope, request.messages);
+
+        while (state.activeReview === dialog) {
+            dialog.showGenerating();
+            let response;
+            try {
+                response = await generateWithProfile(request, dialog);
+            } catch (error) {
+                const stopped = error?.name === 'AbortError' || error?.cause?.name === 'AbortError';
+                // The dialog only has room for the short message, and a bare status code
+                // says nothing about why the provider refused. Keep the whole error where
+                // it can be read.
+                if (!stopped) console.error('[ST Inline AI Editor] Generation failed.', error, error?.cause);
+                dialog.showError(stopped ? '請重新生成或關閉視窗。' : (error?.cause?.message || error?.message || 'API 請求失敗。'), stopped);
+                const decision = await dialog.waitAction();
+                if (decision === 'regenerate') continue;
+                dialog.close();
+                return;
+            }
+
+            if (response.stopped) {
+                dialog.showError('請重新生成或關閉視窗。', true);
+                const decision = await dialog.waitAction();
+                if (decision === 'regenerate') continue;
+                dialog.close();
+                return;
+            }
+
+            if (!response.text.trim()) {
+                dialog.showError('模型沒有傳回任何文字。');
+                const decision = await dialog.waitAction();
+                if (decision === 'regenerate') continue;
+                dialog.close();
+                return;
+            }
+
+            const parsed = parseAiResponse(response.text, action.mode, scope.text, Boolean(reference.block));
+            dialog.showResult(parsed);
+            const decision = await dialog.waitAction();
+            if (decision === 'regenerate') continue;
+            if (decision === 'accept') {
+                // Read off the dialog, not off `parsed`: the ticked subset is what
+                // the user just looked at, and `parsed.text` is only the all-ticked
+                // case. Must happen before dialog.close().
+                const acceptedText = dialog.resultText();
+                session.textarea.focus();
+                session.textarea.setSelectionRange(scope.start, scope.end);
+                session.textarea.setRangeText(acceptedText, scope.start, scope.end, 'select');
+                session.textarea.dispatchEvent(new hostWindow.Event('input', { bubbles: true }));
+                session.draft = session.textarea.value;
+                updateScopeNotice(session);
+                toast('success', '修改已加入草稿，尚未寫入樓層。');
+            }
+            dialog.close();
+            return;
+        }
+    }
+
+    // ══════ 更新：檢查與寫回腳本庫 ══════
+
+    // Why this can work at all: TavernHelper 4.8.0 added getScriptTrees /
+    // updateScriptTreesWith, so a script can find itself in the library and replace its
+    // own content. The script is not deleted and recreated, so its script_id survives —
+    // and because settings are script variables keyed by that id, they survive with it.
+    // That is the entire point: importing a new copy has always meant starting empty.
+    //
+    // ⚠️ TavernHelper's own annotation for ScriptTreesOptions contradicts itself (the
+    // prose says 'chat'/'preset'/'global', the type says 'global'/'preset'/'character'),
+    // so all three are asked rather than betting on one. Betting wrong would mean writing
+    // the new source into a list this script is not in.
+    const SCRIPT_TREE_TYPES = ['global', 'preset', 'character'];
+    const UPDATE_TIMEOUT_MS = 15000;
+
+    function scriptUpdateApiAvailable() {
+        return typeof tavern.getScriptTrees === 'function'
+            && typeof tavern.updateScriptTreesWith === 'function'
+            && typeof globalScope.getScriptId === 'function';
+    }
+
+    // Returns { type, selfId } or null. Folders hold scripts one level down, which is the
+    // only nesting the ScriptTree type allows.
+    function findSelfInScriptTrees() {
+        if (!scriptUpdateApiAvailable()) return null;
+        const selfId = globalScope.getScriptId();
+        if (!selfId) return null;
+        for (const type of SCRIPT_TREE_TYPES) {
+            let trees;
+            try {
+                trees = tavern.getScriptTrees({ type });
+            } catch {
+                continue;
+            }
+            const holdsSelf = (trees || []).some(node => (node?.type === 'folder'
+                ? (node.scripts || []).some(script => script?.id === selfId)
+                : node?.id === selfId));
+            if (holdsSelf) return { type, selfId };
+        }
+        return null;
+    }
+
+    async function fetchUpdateSource() {
+        const controller = new hostWindow.AbortController();
+        const timer = hostWindow.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
+        try {
+            // ?t= on top of no-store because the CDN in front of raw.githubusercontent
+            // caches for several minutes; without it "檢查更新" right after a release
+            // would keep reporting the old version.
+            const response = await hostWindow.fetch(`${UPDATE_SOURCE_URL}?t=${Date.now()}`, { cache: 'no-store', signal: controller.signal });
+            // 404 has one overwhelmingly likely cause and it is not "the file moved":
+            // raw.githubusercontent serves nothing at all for a private repository, so a
+            // repo that is private (or has been made private again) answers 404 to
+            // everyone. Saying only "HTTP 404" sends the reader hunting for a typo.
+            if (!response.ok) {
+                throw new Error(response.status === 404
+                    ? '抓不到更新來源（HTTP 404）。最常見的原因是那個 GitHub repo 是私有的——私有 repo 的公開網址對誰都是 404。'
+                    : `HTTP ${response.status}`);
+            }
+            return await response.text();
+        } finally {
+            hostWindow.clearTimeout(timer);
+        }
+    }
+
+    function updateAvailable() {
+        const latest = state.update.latest || state.settings.updateLatestVersion;
+        return Boolean(latest) && compareVersions(latest, VERSION) > 0;
+    }
+
+    // silent: the daily background check. A failure there is not the user's doing and
+    // says nothing about the editing they are in the middle of, so it stays quiet.
+    async function checkForUpdate({ silent = true } = {}) {
+        if (state.update.checking) return;
+        state.update.checking = true;
+        state.update.error = '';
+        renderUpdateSection();
+        try {
+            const source = await fetchUpdateSource();
+            const inspected = inspectUpdateSource(source, VERSION);
+            if (!inspected.ok) throw new Error(inspected.error);
+            state.update.latest = inspected.version;
+            state.update.checked = true;
+            state.settings.updateCheckedAt = Date.now();
+            state.settings.updateLatestVersion = inspected.version;
+            saveSettings();
+            if (!silent) {
+                toast(inspected.newer ? 'success' : 'info', inspected.newer
+                    ? `有新版本 ${inspected.version}（目前 ${VERSION}）。`
+                    : `已經是最新版本（${VERSION}）。`);
+            }
+        } catch (error) {
+            console.warn('[ST Inline AI Editor] Update check failed.', error);
+            state.update.error = String(error?.message || error);
+            // A failed check still counts against the daily budget: retrying on every
+            // page load while offline would be a request storm nobody asked for.
+            state.settings.updateCheckedAt = Date.now();
+            saveSettings();
+            if (!silent) toast('error', `檢查更新失敗：${state.update.error}`);
+        } finally {
+            state.update.checking = false;
+            renderUpdateSection();
+            if (state.activeEditor) markToolbarUpdateBadge(state.activeEditor);
+        }
+    }
+
+    async function writeSelfSource(location, source) {
+        await tavern.updateScriptTreesWith(trees => (trees || []).map(node => {
+            if (node?.type === 'folder') {
+                return { ...node, scripts: (node.scripts || []).map(script => (script?.id === location.selfId ? { ...script, content: source } : script)) };
+            }
+            return node?.id === location.selfId ? { ...node, content: source } : node;
+        }), { type: location.type });
+    }
+
+    // Downloads again rather than reusing whatever the check saw, so the version named in
+    // the confirmation is the version actually about to be written. The check can be
+    // hours old by now.
+    async function runUpdate() {
+        if (state.update.installing) return;
+        const location = findSelfInScriptTrees();
+        if (!location) {
+            toast('error', '在酒館助手的腳本庫裡找不到這支腳本，無法自動更新。請改用手動匯入。');
+            return;
+        }
+        state.update.installing = true;
+        renderUpdateSection();
+        let source;
+        let version;
+        try {
+            source = await fetchUpdateSource();
+            const inspected = inspectUpdateSource(source, VERSION);
+            if (!inspected.ok) throw new Error(inspected.error);
+            version = inspected.version;
+            if (!inspected.newer) {
+                toast('info', `遠端版本是 ${version}，不比目前的 ${VERSION} 新，沒有更新。`);
+                return;
+            }
+        } catch (error) {
+            console.error('[ST Inline AI Editor] Could not fetch the update.', error);
+            toast('error', `抓取新版失敗：${String(error?.message || error)}。目前的腳本沒有被動到。`);
+            return;
+        } finally {
+            state.update.installing = false;
+            renderUpdateSection();
+        }
+
+        const confirmed = await showConfirm(
+            `要把這支腳本從 ${VERSION} 換成 ${version} 嗎？\n\n`
+            + '換的是腳本庫裡這一支的內容，不是新增一份，所以你的設定全部留著：Connection Profile、編輯原則、內建指令的修改、客製指令與分組、世界書勾選。\n\n'
+            + '換完之後要重新整理頁面才會生效。',
+            { confirmLabel: `更新到 ${version}` },
+        );
+        if (!confirmed) return;
+
+        try {
+            await writeSelfSource(location, source);
+        } catch (error) {
+            console.error('[ST Inline AI Editor] Could not write the update.', error);
+            toast('error', `寫入新版失敗：${String(error?.message || error)}。目前的腳本沒有被動到。`);
+            return;
+        }
+        state.settings.updateLatestVersion = version;
+        saveSettings();
+        const reload = await showConfirm(
+            `已經換成 ${version}。要現在重新整理頁面讓它生效嗎？\n\n`
+            + '⚠️ 編輯器裡尚未儲存的草稿會消失。想先存檔的話按取消，稍後自己重新整理即可。',
+            { confirmLabel: '重新整理' },
+        );
+        if (reload) hostWindow.location.reload();
+    }
+
+    function renderUpdateSection() {
+        state.updateRender?.();
+    }
+
+    // A dot on the settings button, because that is where the update lives. Nothing else
+    // in the editor changes — an update is never urgent enough to interrupt an edit.
+    function markToolbarUpdateBadge(session) {
+        session?.settingsButton?.classList.toggle('stiae-has-update', updateAvailable());
+    }
+
+    function maybeCheckForUpdate() {
+        if (!state.settings.updateCheckEnabled) return;
+        if (Date.now() - state.settings.updateCheckedAt < UPDATE_CHECK_INTERVAL_MS) return;
+        checkForUpdate({ silent: true });
+    }
+
+    // ══════ 表單與設定視窗 ══════
+
+    function showSimpleForm(title, buildContent, onSubmit) {
+        return new Promise(resolve => {
+            const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
+            const modal = createElement('section', 'stiae-settings-modal');
+            const header = createElement('header', 'stiae-header');
+            header.append(createElement('strong', '', title));
+            const close = createElement('button', 'stiae-close', '×');
+            close.type = 'button';
+            header.append(close);
+            const form = createElement('form', 'stiae-settings-body');
+            form.id = makeId('form');
+            buildContent(form);
+            const footer = createElement('footer', 'stiae-footer');
+            const cancel = button('取消', 'fa-xmark');
+            const submit = button('確定', 'fa-check', 'stiae-primary');
+            submit.type = 'submit';
+            // The footer sits outside <form>, so the submit button must be associated explicitly.
+            submit.setAttribute('form', form.id);
+            footer.append(cancel, submit);
+            modal.append(header, form, footer);
+            overlay.append(modal);
+            hostDocument.body.append(overlay);
+
+            const finish = value => {
+                overlay.remove();
+                resolve(value);
+            };
+            close.addEventListener('click', () => finish(null));
+            cancel.addEventListener('click', () => finish(null));
+            form.addEventListener('submit', event => {
+                event.preventDefault();
+                const result = onSubmit(form);
+                if (result !== undefined) finish(result);
+            });
+        });
+    }
+
+    async function showOneOffCommand(session) {
+        return showSimpleForm('臨時指令', form => {
+            const instructionField = createElement('div', 'stiae-field');
+            instructionField.append(createElement('label', '', '指示'));
+            const instruction = createElement('textarea');
+            instruction.name = 'instruction';
+            instruction.required = true;
+            instruction.placeholder = '例如：把對話改得更含蓄，但不要改變事件。';
+            instruction.value = session.oneOffInstruction;
+            instructionField.append(instruction);
+            const modeField = createElement('div', 'stiae-field');
+            modeField.append(createElement('label', '', '編輯模式'));
+            const mode = createElement('select');
+            mode.name = 'mode';
+            [['patch', '局部修補（search / replace）'], ['replacement', '全文改寫（replacement）']].forEach(([value, label]) => {
+                const option = createElement('option', '', label);
+                option.value = value;
+                mode.append(option);
+            });
+            mode.value = state.settings.lastCustomMode;
+            modeField.append(mode);
+            form.append(instructionField, modeField);
+            hostWindow.setTimeout(() => instruction.focus(), 0);
+        }, form => {
+            const instruction = form.elements.instruction.value.trim();
+            if (!instruction) return undefined;
+            const mode = form.elements.mode.value === 'replacement' ? 'replacement' : 'patch';
+            state.settings.lastCustomMode = mode;
+            saveSettings();
+            session.oneOffInstruction = instruction;
+            return { id: 'one-off', name: '臨時指令', icon: 'fa-comment-dots', instruction, mode };
+        });
+    }
+
+    async function showCommandForm(existing, isBuiltin = false, groupNames = []) {
+        const command = existing ? clone(existing) : normalizeCommand({ name: '', instruction: '', visible: true }, state.settings.commands.length);
+        const title = isBuiltin ? '編輯內建指令' : (existing ? '編輯客製指令' : '新增客製指令');
+        return showSimpleForm(title, form => {
+            if (isBuiltin) {
+                form.append(createElement(
+                    'div',
+                    'stiae-help',
+                    '這是內建指令。一旦儲存，它就完全照你寫的走——日後版本更新不會再改動它。想拿回出廠內容，用列表上的「還原預設」。',
+                ));
+            }
+            const nameField = createElement('div', 'stiae-field');
+            nameField.append(createElement('label', '', '名稱'));
+            const name = createElement('input');
+            name.name = 'name';
+            name.required = true;
+            name.value = existing ? command.name : '';
+            nameField.append(name);
+
+            // Builtins are deliberately left out of grouping: they keep an identity of
+            // their own and are never folded into the custom list (ADR-0001).
+            const groupField = createElement('div', 'stiae-field');
+            if (!isBuiltin) {
+                groupField.append(createElement('label', '', '分組（選填）'));
+                const group = createElement('input');
+                group.name = 'group';
+                group.value = command.group;
+                group.placeholder = '留空＝不分組。打一個新名字就會開一個新的組。';
+                const listId = makeId('groups');
+                const datalist = createElement('datalist');
+                datalist.id = listId;
+                for (const name of groupNames) {
+                    const option = createElement('option');
+                    option.value = name;
+                    datalist.append(option);
+                }
+                group.setAttribute('list', listId);
+                groupField.append(group, datalist, createElement('div', 'stiae-help', '同一組的指令會排在一起，⋯ 選單裡也會分段。'));
+            }
+
+            const row = createElement('div', 'stiae-inline-fields');
+            const iconField = createElement('div', 'stiae-field');
+            iconField.append(createElement('label', '', '圖示'));
+            const icon = createElement('select');
+            icon.name = 'icon';
+            ICONS.forEach(([value, label]) => {
+                const option = createElement('option', '', label);
+                option.value = value;
+                icon.append(option);
+            });
+            icon.value = command.icon;
+            iconField.append(icon);
+            const modeField = createElement('div', 'stiae-field');
+            modeField.append(createElement('label', '', '編輯模式'));
+            const mode = createElement('select');
+            mode.name = 'mode';
+            [['patch', '局部修補'], ['replacement', '全文改寫']].forEach(([value, label]) => {
+                const option = createElement('option', '', label);
+                option.value = value;
+                mode.append(option);
+            });
+            mode.value = command.mode;
+            modeField.append(mode);
+            row.append(iconField, modeField);
+
+            const instructionField = createElement('div', 'stiae-field');
+            instructionField.append(createElement('label', '', '指示'));
+            const instruction = createElement('textarea');
+            instruction.name = 'instruction';
+            instruction.required = true;
+            instruction.value = command.instruction;
+            instructionField.append(instruction);
+
+            const systemField = createElement('div', 'stiae-field');
+            systemField.append(createElement('label', '', '編輯原則覆寫（選填）'));
+            const systemPrompt = createElement('textarea');
+            systemPrompt.name = 'systemPrompt';
+            systemPrompt.value = command.systemPrompt;
+            systemPrompt.placeholder = '留空時沿用全域編輯原則；填了則取代它，不是疊加。輸出協定不受影響。';
+            systemField.append(systemPrompt);
+
+            const advanced = createElement('div', 'stiae-inline-fields');
+            const profileField = createElement('div', 'stiae-field');
+            profileField.append(createElement('label', '', 'Connection Profile 覆寫'));
+            const profile = createElement('select');
+            profile.name = 'profileId';
+            addProfileOptions(profile, command.profileId, true);
+            profileField.append(profile);
+            const tokensField = createElement('div', 'stiae-field');
+            tokensField.append(createElement('label', '', '最大輸出 Tokens（選填）'));
+            const maxTokens = createElement('input');
+            maxTokens.name = 'maxTokens';
+            maxTokens.type = 'number';
+            maxTokens.min = '64';
+            maxTokens.step = '1';
+            maxTokens.placeholder = '沿用全域設定';
+            maxTokens.value = command.maxTokens || '';
+            tokensField.append(maxTokens);
+            advanced.append(profileField, tokensField);
+
+            const visibleLabel = createElement('label', 'stiae-checkbox');
+            const visible = createElement('input');
+            visible.name = 'visible';
+            visible.type = 'checkbox';
+            visible.checked = command.visible;
+            visibleLabel.append(visible, createElement('span', '', '顯示在編輯器指令列'));
+            form.append(nameField, groupField, row, instructionField, systemField, advanced, visibleLabel);
+            hostWindow.setTimeout(() => name.focus(), 0);
+        }, form => {
+            const name = form.elements.name.value.trim();
+            const instruction = form.elements.instruction.value.trim();
+            if (!name || !instruction) return undefined;
+            const maxTokensValue = Number(form.elements.maxTokens.value);
+            return normalizeCommand({
+                ...command,
+                name,
+                // The field is absent for builtins, which is not the same as it being blank.
+                group: form.elements.group ? form.elements.group.value : command.group,
+                icon: form.elements.icon.value,
+                instruction,
+                mode: form.elements.mode.value,
+                systemPrompt: form.elements.systemPrompt.value.trim(),
+                profileId: form.elements.profileId.value,
+                profileName: getProfiles().find(profileItem => profileItem.id === form.elements.profileId.value)?.name || '',
+                maxTokens: maxTokensValue > 0 ? maxTokensValue : null,
+                visible: form.elements.visible.checked,
+            }, 0);
+        });
+    }
+
+    // The clipboard is not reachable from every SillyTavern install, and a settings
+    // backup that silently fails to copy is worse than no backup at all. This is the
+    // fallback: show the text so it can be selected by hand.
+    function showPayloadExport(title, text) {
+        return showSimpleForm(title, form => {
+            const field = createElement('div', 'stiae-field');
+            field.append(createElement('label', '', '備份文字'));
+            const area = createElement('textarea', 'stiae-payload-text');
+            area.value = text;
+            area.readOnly = true;
+            field.append(area, createElement('div', 'stiae-help', '無法自動存取剪貼簿。請全選這段文字自行複製保存。'));
+            form.append(field);
+            hostWindow.setTimeout(() => { area.focus(); area.select(); }, 0);
+        }, () => null);
+    }
+
+    function showSettingsImport() {
+        return showSimpleForm('貼上設定', form => {
+            const field = createElement('div', 'stiae-field');
+            field.append(createElement('label', '', '設定文字'));
+            const area = createElement('textarea', 'stiae-payload-text');
+            area.name = 'payload';
+            area.required = true;
+            area.placeholder = '把「複製設定」產生的文字貼在這裡。';
+            field.append(area, createElement('div', 'stiae-help', '匯入會覆蓋目前全部設定：Connection Profile、全域編輯原則、內建指令的修改與所有客製指令。'));
+            form.append(field);
+            hostWindow.setTimeout(() => area.focus(), 0);
+        }, form => {
+            const parsed = parseSettingsPayload(form.elements.payload.value);
+            // Returning undefined leaves the dialog open so the text can be fixed.
+            if (!parsed.ok) {
+                toast('error', parsed.error);
+                return undefined;
+            }
+            return parsed;
+        });
+    }
+
+    function showCommandsImport() {
+        return showSimpleForm('貼上客製指令', form => {
+            const field = createElement('div', 'stiae-field');
+            field.append(createElement('label', '', '指令文字'));
+            const area = createElement('textarea', 'stiae-payload-text');
+            area.name = 'payload';
+            area.required = true;
+            area.placeholder = '把「複製指令」產生的文字貼在這裡。';
+            field.append(area, createElement('div', 'stiae-help', '匯入是「加進去」：你現有的客製指令一條都不會被刪掉或覆蓋。同名的兩條都會留著，由你自己決定要刪哪一條。'));
+            form.append(field);
+            hostWindow.setTimeout(() => area.focus(), 0);
+        }, form => {
+            const parsed = parseCommandsPayload(form.elements.payload.value);
+            if (!parsed.ok) {
+                toast('error', parsed.error);
+                return undefined;
+            }
+            return parsed;
+        });
+    }
+
+    function openSettings(focusProfile = false) {
+        if (state.activeSettings) return;
+        const draft = clone(state.settings);
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
+        const modal = createElement('section', 'stiae-settings-modal');
+        const header = createElement('header', 'stiae-header');
+        header.append(createElement('strong', '', 'AI 內文編輯器設定'));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        header.append(close);
+        const body = createElement('div', 'stiae-settings-body');
+
+        const profileField = createElement('div', 'stiae-field');
+        profileField.append(createElement('label', '', '預設 Connection Profile'));
+        const profileSelect = createElement('select');
+        addProfileOptions(profileSelect, draft.defaultProfileId);
+        profileField.append(profileSelect, createElement('div', 'stiae-help', '此 Profile 只供 AI 內文編輯器使用，不會切換主聊天連線。'));
+
+        const tokensField = createElement('div', 'stiae-field');
+        tokensField.append(createElement('label', '', '預設最大輸出 Tokens'));
+        const tokens = createElement('input');
+        tokens.type = 'number';
+        tokens.min = '64';
+        tokens.step = '1';
+        tokens.value = String(draft.defaultMaxTokens);
+        tokensField.append(tokens);
+
+        const promptField = createElement('div', 'stiae-field');
+        promptField.append(createElement('label', '', '全域編輯原則'));
+        const prompt = createElement('textarea');
+        prompt.value = draft.globalPrompt;
+        promptField.append(prompt, createElement('div', 'stiae-help', '每次請求都會附上。輸出標籤與範圍限制屬於輸出協定，不受這裡影響。'));
+
+        const builtinHeader = createElement('div', 'stiae-field-label', '內建指令');
+        const builtinList = createElement('div', 'stiae-command-list');
+
+        // Builtins are rendered from resolveCommands rather than from the draft, so the
+        // dialog and the toolbar can never disagree about what an override resolves to.
+        const renderBuiltins = () => {
+            builtinList.replaceChildren();
+            for (const command of resolveCommands(draft).builtins) {
+                const row = createElement('div', 'stiae-command-row');
+                const icon = createElement('i', `fa-solid ${command.icon}`);
+                const name = createElement('div');
+                name.append(createElement('strong', '', command.name));
+                const marks = [command.mode === 'patch' ? '局部修補' : '全文改寫'];
+                if (!command.visible) marks.push('已隱藏');
+                marks.push(command.modified ? '已修改' : '出廠狀態');
+                name.append(createElement('div', 'stiae-help', marks.join(' · ')));
+                const actions = createElement('div', 'stiae-command-row-actions');
+                const toggle = button('', command.visible ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
+                toggle.title = command.visible ? '從指令列隱藏' : '顯示在指令列';
+                const edit = button('', 'fa-pen', 'stiae-icon-button');
+                edit.title = '編輯';
+                const reset = button('', 'fa-rotate-left', 'stiae-icon-button');
+                reset.title = command.modified ? '還原預設' : '目前就是出廠內容';
+                reset.disabled = !command.modified;
+                toggle.addEventListener('click', () => {
+                    draft.builtinOverrides[command.id] = { ...command, visible: !command.visible };
+                    renderBuiltins();
+                });
+                edit.addEventListener('click', async () => {
+                    const updated = await showCommandForm(command, true);
+                    if (updated) {
+                        draft.builtinOverrides[command.id] = updated;
+                        renderBuiltins();
+                    }
+                });
+                reset.addEventListener('click', async () => {
+                    if (await showConfirm(`把內建指令「${command.name}」還原成出廠內容嗎？你對它做的修改會消失。`, { confirmLabel: '還原預設', danger: true })) {
+                        delete draft.builtinOverrides[command.id];
+                        renderBuiltins();
+                    }
+                });
+                actions.append(toggle, edit, reset);
+                row.append(icon, name, actions);
+                builtinList.append(row);
+            }
+        };
+
+        const commandHeader = createElement('div', 'stiae-field-label', '客製指令');
+        const commandList = createElement('div', 'stiae-command-list');
+        const addCommand = button('新增客製指令', 'fa-plus');
+
+        const renderCommands = () => {
+            // Re-sorted on every render rather than only on save: a command that just had
+            // its group changed has to move to that group now, or the up/down buttons
+            // would be acting on positions the list is not showing.
+            draft.commands = sortCommandsByGroup(draft.commands);
+            commandList.replaceChildren();
+            if (!draft.commands.length) commandList.append(createElement('div', 'stiae-help', '尚未建立客製指令。'));
+            // Headings only once there is a real group. A list where everything is
+            // ungrouped is every pre-0.7.0 setup, and it should look untouched.
+            const grouped = commandGroupNames(draft.commands).length > 0;
+            let lastGroup = null;
+            draft.commands.forEach((command, index) => {
+                const group = command.group || '';
+                if (grouped && group !== lastGroup) {
+                    commandList.append(createElement('div', 'stiae-command-group', group || '未分組'));
+                }
+                lastGroup = group;
+                const firstOfGroup = index === 0 || (draft.commands[index - 1].group || '') !== group;
+                const lastOfGroup = index === draft.commands.length - 1 || (draft.commands[index + 1].group || '') !== group;
+                const row = createElement('div', 'stiae-command-row');
+                const icon = createElement('i', `fa-solid ${command.icon}`);
+                const name = createElement('div');
+                name.append(createElement('strong', '', command.name));
+                name.append(createElement('div', 'stiae-help', `${command.mode === 'patch' ? '局部修補' : '全文改寫'}${command.visible ? '' : ' · 已隱藏'}`));
+                const actions = createElement('div', 'stiae-command-row-actions');
+                const toggle = button('', command.visible ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
+                toggle.title = command.visible ? '從指令列隱藏' : '顯示在指令列';
+                // Movement is within the group. Crossing a boundary here would mean
+                // changing the command's group as a side effect of an arrow press.
+                const up = button('', 'fa-arrow-up', 'stiae-icon-button');
+                up.title = grouped ? '在這一組裡上移' : '上移';
+                up.disabled = firstOfGroup;
+                const down = button('', 'fa-arrow-down', 'stiae-icon-button');
+                down.title = grouped ? '在這一組裡下移' : '下移';
+                down.disabled = lastOfGroup;
+                const edit = button('', 'fa-pen', 'stiae-icon-button');
+                edit.title = '編輯';
+                const remove = button('', 'fa-trash', 'stiae-icon-button stiae-danger');
+                remove.title = '刪除';
+                toggle.addEventListener('click', () => { command.visible = !command.visible; renderCommands(); });
+                up.addEventListener('click', () => {
+                    [draft.commands[index - 1], draft.commands[index]] = [draft.commands[index], draft.commands[index - 1]];
+                    renderCommands();
+                });
+                down.addEventListener('click', () => {
+                    [draft.commands[index + 1], draft.commands[index]] = [draft.commands[index], draft.commands[index + 1]];
+                    renderCommands();
+                });
+                edit.addEventListener('click', async () => {
+                    const updated = await showCommandForm(command, false, commandGroupNames(draft.commands));
+                    if (updated) {
+                        draft.commands[index] = updated;
+                        renderCommands();
+                    }
+                });
+                remove.addEventListener('click', async () => {
+                    if (await showConfirm(`刪除客製指令「${command.name}」嗎？`, { confirmLabel: '刪除', danger: true })) {
+                        draft.commands.splice(index, 1);
+                        renderCommands();
+                    }
+                });
+                actions.append(toggle, up, down, edit, remove);
+                row.append(icon, name, actions);
+                commandList.append(row);
+            });
+        };
+        addCommand.addEventListener('click', async () => {
+            const created = await showCommandForm(null, false, commandGroupNames(draft.commands));
+            if (created) {
+                draft.commands.push(created);
+                renderCommands();
+            }
+        });
+        // Sits with the command list rather than under 設定備份 on purpose: this pair
+        // carries only these commands, and putting it beside the whole-settings backup
+        // would make the two look like the same button with a different label.
+        const commandBackupRow = createElement('div', 'stiae-inline-fields stiae-button-row');
+        const copyCommands = button('複製指令', 'fa-copy');
+        const pasteCommands = button('貼上指令', 'fa-paste');
+        commandBackupRow.append(copyCommands, pasteCommands);
+        const commandBackupHelp = createElement(
+            'div',
+            'stiae-help',
+            '只含客製指令與它們的分組，不含 Connection Profile、編輯原則與內建指令的修改——那些走下面的「設定備份」。貼上是加進去，現有的指令不會被覆蓋。',
+        );
+
+        copyCommands.addEventListener('click', async () => {
+            if (!draft.commands.length) {
+                toast('info', '目前沒有客製指令可以複製。');
+                return;
+            }
+            const text = serializeCommands(draft.commands);
+            try {
+                await hostWindow.navigator.clipboard.writeText(text);
+                toast('success', `已複製 ${draft.commands.length} 條客製指令到剪貼簿。`);
+            } catch {
+                showPayloadExport('複製客製指令', text);
+            }
+        });
+
+        pasteCommands.addEventListener('click', async () => {
+            const parsed = await showCommandsImport();
+            if (!parsed) return;
+            // ⚠️ New ids for everything coming in. A backup taken from this same install
+            // would otherwise arrive carrying ids that are already in the list.
+            const incoming = parsed.commands.map(command => ({ ...command, id: makeId() }));
+            const existingNames = new Set(draft.commands.map(command => command.name));
+            const duplicates = incoming.filter(command => existingNames.has(command.name)).length;
+            draft.commands = sortCommandsByGroup([...draft.commands, ...incoming]);
+            renderCommands();
+            const dupeNote = duplicates ? `，其中 ${duplicates} 條與現有指令同名（兩邊都留著）` : '';
+            toast('success', `已加入 ${incoming.length} 條客製指令${dupeNote}。記得按「儲存設定」。`);
+        });
+
+        const backupHeader = createElement('div', 'stiae-field-label', '設定備份');
+        const backupRow = createElement('div', 'stiae-inline-fields stiae-button-row');
+        const copySettings = button('複製設定', 'fa-copy');
+        const pasteSettings = button('貼上設定', 'fa-paste');
+        backupRow.append(copySettings, pasteSettings);
+        const backupHelp = createElement(
+            'div',
+            'stiae-help',
+            '每次匯入腳本都會產生新的一份，設定不會自動帶過來。升級前先「複製設定」留一份，匯入新版後貼回來。複製出來的內容只有設定，不含任何聊天內容。',
+        );
+
+        const updateHeader = createElement('div', 'stiae-field-label', '版本與更新');
+        const updateStatus = createElement('div', 'stiae-help');
+        const updateRow = createElement('div', 'stiae-inline-fields stiae-button-row');
+        const checkUpdate = button('檢查更新', 'fa-rotate');
+        const installUpdate = button('更新腳本', 'fa-download', 'stiae-primary');
+        updateRow.append(checkUpdate, installUpdate);
+        const autoCheckLabel = createElement('label', 'stiae-checkbox');
+        const autoCheck = createElement('input');
+        autoCheck.type = 'checkbox';
+        autoCheck.checked = draft.updateCheckEnabled;
+        autoCheckLabel.append(autoCheck, createElement('span', '', '每天自動檢查一次有沒有新版'));
+        const updateHelp = createElement(
+            'div',
+            'stiae-help',
+            '更新換掉的是腳本庫裡這一支腳本的內容，不會新增第二份——所以你的設定、客製指令與世界書勾選全都留著，不必再複製貼上一次。換完要重新整理頁面才生效。',
+        );
+        const updateRisk = createElement(
+            'div',
+            'stiae-help',
+            '更新來源固定是這個專案的 GitHub，抓下來的內容會先檢查過才寫入。但這仍等於允許那個 repo 的擁有者在你的瀏覽器裡執行程式碼——不放心就把自動檢查關掉，改用手動匯入。',
+        );
+        const updateLink = createElement('div', 'stiae-help');
+        const updateAnchor = createElement('a', '', '在 GitHub 上看變更說明');
+        updateAnchor.href = UPDATE_HOME_URL;
+        updateAnchor.target = '_blank';
+        updateAnchor.rel = 'noreferrer noopener';
+        updateLink.append(updateAnchor);
+        const updateUnsupported = createElement(
+            'div',
+            'stiae-reference-bad',
+            '你的酒館助手沒有寫入腳本庫的 API（需要 4.8.0 以上），所以只能查有沒有新版，更新要自己手動匯入。',
+        );
+
+        const renderUpdate = () => {
+            const supported = scriptUpdateApiAvailable();
+            const latest = state.update.latest || draft.updateLatestVersion;
+            const newer = Boolean(latest) && compareVersions(latest, VERSION) > 0;
+            if (state.update.checking) updateStatus.textContent = `目前版本 ${VERSION} · 正在檢查…`;
+            else if (state.update.installing) updateStatus.textContent = `目前版本 ${VERSION} · 正在下載新版…`;
+            else if (state.update.error) updateStatus.textContent = `目前版本 ${VERSION} · 上次檢查失敗：${state.update.error}`;
+            else if (newer) updateStatus.textContent = `目前版本 ${VERSION} · 有新版本 ${latest}`;
+            else if (latest) updateStatus.textContent = `目前版本 ${VERSION} · 已經是最新的`;
+            else updateStatus.textContent = `目前版本 ${VERSION} · 還沒檢查過`;
+            const busy = state.update.checking || state.update.installing;
+            checkUpdate.disabled = busy;
+            installUpdate.disabled = busy || !newer;
+            installUpdate.querySelector('span').textContent = newer ? `更新到 ${latest}` : '更新腳本';
+            installUpdate.classList.toggle('stiae-hidden', !supported);
+            updateUnsupported.classList.toggle('stiae-hidden', supported);
+        };
+        state.updateRender = renderUpdate;
+        renderUpdate();
+        checkUpdate.addEventListener('click', () => checkForUpdate({ silent: false }));
+        installUpdate.addEventListener('click', () => runUpdate());
+
+        // Persistent, and collapsed by default. The list can run to dozens of rows, and
+        // the dialog is already one long scroll — but the summary states the count, so
+        // the setting is never invisible.
+        const regexSection = createElement('details', 'stiae-regex-section');
+        const regexSummary = createElement('summary', 'stiae-field-label');
+        const regexBody = createElement('div', 'stiae-regex-body');
+        regexSection.append(regexSummary, regexBody);
+
+        // 「正則規則」carries the heading; what it applies to and how many are ticked ride
+        // along in the smaller note. The count has to stay visible somewhere — this
+        // section is collapsed by default, and a silently-collapsed setting is invisible.
+        const updateRegexSummary = () => {
+            regexSummary.replaceChildren(
+                createElement('span', '', '正則規則'),
+                createElement('span', 'stiae-label-note', `套用在參考資料上 · 已勾選 ${draft.regexRuleIds.length} 條`),
+            );
+        };
+
+        const renderRegexRules = rules => {
+            regexBody.replaceChildren();
+            regexBody.append(createElement(
+                'div',
+                'stiae-help',
+                '勾選的規則會在參考樓層送給 AI 之前套用。勾了就跑——不看規則自帶的深度與目的地，也不看它在 SillyTavern 裡是不是停用中。所以你可以建一條只在編輯時用的規則，在正常聊天關掉、只在這裡勾起來。',
+            ));
+            regexBody.append(createElement(
+                'div',
+                'stiae-help',
+                '唯一的例外是「來源」：只寫給 AI 輸出的規則不會套到使用者樓層，反之亦然。這一項規則自己說了算，因為正則看不到一段文字是誰寫的，工具不代它猜。',
+            ));
+            regexBody.append(createElement(
+                'div',
+                'stiae-help',
+                '⚠ 標記代表那條規則自己設了條件、而這裡會忽略它。一整套按深度分工的規則不要整組勾——它們原本互不重疊，條件被拿掉之後會互相把對方的內容刪光。挑做你要的事的那一條就好。',
+            ));
+            if (rules === null) {
+                regexBody.append(createElement('div', 'stiae-reference-bad', '讀不到 SillyTavern 的正則規則。參考資料會以原始文字送出。'));
+                return;
+            }
+            const known = new Set(rules.map(rule => String(rule.id)));
+            const orphans = draft.regexRuleIds.filter(id => !known.has(id));
+            // Selections are stored by rule id, and character-scoped rules disappear
+            // with the character card. Saying so beats dropping them without a word.
+            if (orphans.length) {
+                regexBody.append(createElement(
+                    'div',
+                    'stiae-reference-bad',
+                    `有 ${orphans.length} 條已勾選的規則在目前角色下找不到，這次不會套用。切回原本的角色卡就會再出現。`,
+                ));
+            }
+            if (!rules.length) {
+                regexBody.append(createElement('div', 'stiae-help', 'SillyTavern 裡目前沒有任何正則規則。'));
+                return;
+            }
+            const list = createElement('div', 'stiae-regex-list');
+            for (const rule of rules) {
+                const id = String(rule.id);
+                const label = createElement('label', 'stiae-regex-row');
+                const box = createElement('input');
+                box.type = 'checkbox';
+                box.checked = draft.regexRuleIds.includes(id);
+                const text = createElement('div');
+                text.append(createElement('strong', '', String(rule.script_name || '未命名規則')));
+                const marks = [rule.scope === 'character' ? '角色專屬' : '全域'];
+                if (!rule.enabled) marks.push('ST 中已停用');
+                const scopeNote = describeRuleScope(rule);
+                if (scopeNote) marks.push(scopeNote);
+                if (ruleUsesMacro(rule)) marks.push('含巨集，本工具不會展開');
+                text.append(createElement('div', 'stiae-help', marks.join(' · ')));
+                for (const override of describeRuleOverrides(rule)) {
+                    text.append(createElement('div', 'stiae-regex-override', `⚠ ${override}`));
+                }
+                box.addEventListener('change', () => {
+                    draft.regexRuleIds = box.checked
+                        ? [...new Set([...draft.regexRuleIds, id])]
+                        : draft.regexRuleIds.filter(value => value !== id);
+                    updateRegexSummary();
+                });
+                label.append(box, text);
+                list.append(label);
+            }
+            regexBody.append(list);
+        };
+
+        updateRegexSummary();
+        regexBody.append(createElement('div', 'stiae-help', '正在讀取 SillyTavern 的正則規則…'));
+        readTavernRegexes().then(renderRegexRules);
+
+        renderBuiltins();
+        renderCommands();
+        body.append(
+            profileField,
+            tokensField,
+            promptField,
+            builtinHeader,
+            builtinList,
+            createElement('div', 'stiae-help', '內建指令不能刪除，也不與客製指令混合排序。'),
+            commandHeader,
+            commandList,
+            addCommand,
+            commandBackupRow,
+            commandBackupHelp,
+            // No divider elements between the blocks: .stiae-field-label carries its own
+            // rule and spacing, so each heading separates itself from what came before.
+            // Having both drew two lines with a gap trapped between them.
+            regexSection,
+            backupHeader,
+            backupRow,
+            backupHelp,
+            updateHeader,
+            updateStatus,
+            updateRow,
+            autoCheckLabel,
+            updateHelp,
+            updateRisk,
+            updateLink,
+            updateUnsupported,
+        );
+
+        const footer = createElement('footer', 'stiae-footer');
+        const cancel = button('取消', 'fa-xmark');
+        const save = button('儲存設定', 'fa-check', 'stiae-primary');
+        footer.append(cancel, save);
+        modal.append(header, body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+        state.activeSettings = overlay;
+
+        const dismiss = () => {
+            overlay.remove();
+            state.activeSettings = null;
+            state.updateRender = null;
+        };
+        // The three plain fields only live in the DOM until this runs, so both saving
+        // and copying have to pull them in first — otherwise a copied backup silently
+        // carries the values from before the user's latest edits.
+        const collectDraft = () => {
+            draft.defaultProfileId = profileSelect.value;
+            draft.defaultProfileName = getProfiles().find(profile => profile.id === profileSelect.value)?.name || '';
+            draft.globalPrompt = prompt.value.trim() || DEFAULT_GLOBAL_PROMPT;
+            const tokenValue = Number(tokens.value);
+            draft.defaultMaxTokens = tokenValue >= 64 ? Math.round(tokenValue) : 2048;
+            draft.updateCheckEnabled = autoCheck.checked;
+            // ⚠️ Taken from the live settings, not from the draft. A check that finished
+            // while this dialog was open has already saved these two, and copying the
+            // draft's stale values over them would undo that check — the next page load
+            // would go and ask again.
+            draft.updateCheckedAt = state.settings.updateCheckedAt;
+            draft.updateLatestVersion = state.settings.updateLatestVersion;
+            return normalizeSettings(draft);
+        };
+
+        copySettings.addEventListener('click', async () => {
+            const text = serializeSettings(collectDraft());
+            try {
+                await hostWindow.navigator.clipboard.writeText(text);
+                toast('success', '設定已複製到剪貼簿。');
+            } catch {
+                showPayloadExport('複製設定', text);
+            }
+        });
+
+        pasteSettings.addEventListener('click', async () => {
+            const parsed = await showSettingsImport();
+            if (!parsed) return;
+            const overwrite = await showConfirm(
+                '確定要用貼上的設定覆蓋目前全部設定嗎？目前的 Connection Profile、全域編輯原則、內建指令修改與客製指令都會被取代。',
+                { confirmLabel: '覆蓋設定', danger: true },
+            );
+            if (!overwrite) return;
+            state.settings = parsed.settings;
+            saveSettings();
+            if (state.activeEditor) {
+                renderEditorToolbar(state.activeEditor);
+                refreshReference(state.activeEditor);
+            }
+            const from = parsed.sourceVersion ? `（來源版本 ${parsed.sourceVersion}）` : '';
+            toast('success', `設定已匯入${from}。`);
+            dismiss();
+            openSettings();
+        });
+
+        close.addEventListener('click', dismiss);
+        cancel.addEventListener('click', dismiss);
+        save.addEventListener('click', () => {
+            state.settings = collectDraft();
+            saveSettings();
+            if (state.activeEditor) {
+                renderEditorToolbar(state.activeEditor);
+                // A changed regex selection changes what the open editor would send.
+                refreshReference(state.activeEditor);
+            }
+            toast('success', 'AI 內文編輯器設定已儲存。');
+            dismiss();
+        });
+        if (focusProfile) hostWindow.setTimeout(() => profileSelect.focus(), 0);
+    }
+
+    // ══════ 生命週期：事件、清理、啟動 ══════
+
+    function onDocumentClick(event) {
+        const wand = event.target.closest?.('.stiae-wand');
+        if (!wand) return;
+        event.preventDefault();
+        event.stopPropagation();
+        openEditor(Number(wand.dataset.messageId));
+    }
+
+    function onDocumentKeydown(event) {
+        const wand = event.target.closest?.('.stiae-wand');
+        if (wand && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            openEditor(Number(wand.dataset.messageId));
+            return;
+        }
+        // A confirmation handles its own Escape; letting this run too would close the
+        // editor out from under the question it is asking. Same for the world info
+        // picker — it is a window in its own right and answers Escape itself.
+        if (event.key === 'Escape' && state.activeEditor && !state.activeReview && !state.activeSettings && !state.activeConfirm && !state.activeWorldbook) {
+            requestCloseEditor(state.activeEditor);
+        }
+    }
+
+    function destroy() {
+        if (state.destroyed) return;
+        state.destroyed = true;
+        state.observer?.disconnect();
+        state.activeReview?.close?.();
+        state.activeSettings?.remove?.();
+        state.activeWorldbook?.remove?.();
+        state.activeEditor?.overlay?.remove?.();
+        hostDocument.removeEventListener('click', onDocumentClick, true);
+        hostDocument.removeEventListener('keydown', onDocumentKeydown, true);
+        hostDocument.querySelectorAll('.stiae-wand').forEach(element => element.remove());
+        hostDocument.querySelectorAll(`.${ROOT_CLASS}`).forEach(element => element.remove());
+        hostDocument.getElementById(STYLE_ID)?.remove();
+        if (hostWindow[INSTANCE_KEY]?.version === VERSION) delete hostWindow[INSTANCE_KEY];
+    }
+
+    state.settings = readSettings();
+    injectStyles();
+    await waitForDocument();
+    hostDocument.addEventListener('click', onDocumentClick, true);
+    hostDocument.addEventListener('keydown', onDocumentKeydown, true);
+    installWandObserver();
+
+    hostWindow[INSTANCE_KEY] = {
+        version: VERSION,
+        destroy,
+        openEditor,
+        openSettings,
+        core: TEST_API,
+    };
+    // Fire and forget, once a day at most, and silent on failure. Nothing waits for it —
+    // the editor is fully usable whether or not GitHub answers.
+    maybeCheckForUpdate();
+    console.info(`[ST Inline AI Editor] v${VERSION} ready.`);
+})(typeof window !== 'undefined' ? window : globalThis);
