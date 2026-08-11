@@ -62,7 +62,6 @@
     // Releases get there via `node tools/publish-dist.cjs <資料夾>`.
     const UPDATE_SOURCE_URL = 'https://raw.githubusercontent.com/lceo72/st-inline-ai-editor-dist/main/inline-ai-editor.js';
     const UPDATE_HOME_URL = 'https://github.com/lceo72/st-inline-ai-editor-dist';
-    const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
     // The script has never been anywhere near this small. A truncated response, a captive
     // portal's login page or an error page dressed as 200 all land far below it.
     const UPDATE_MIN_LENGTH = 60000;
@@ -264,12 +263,11 @@
                 ? Math.round(Number(settings.defaultMaxTokens))
                 : 2048,
             lastCustomMode: settings.lastCustomMode === 'replacement' ? 'replacement' : 'patch',
-            // Update checking. On by default, and switchable off: a tool that reaches the
-            // network by itself has to be stoppable without editing anything. The other
-            // two remember the last check so reloading SillyTavern does not mean asking
-            // GitHub again, and so the notice survives that reload.
-            updateCheckEnabled: settings.updateCheckEnabled !== false,
-            updateCheckedAt: finiteOr(settings.updateCheckedAt, 0),
+            // The result of the last time 檢查更新 was pressed. Remembered only so the dot
+            // on the settings button survives a page reload — nothing here ever triggers a
+            // request. ⚠️ There is deliberately no scheduled check and no enable switch:
+            // the tool reaches the network when the button is pressed, and at no other
+            // time, so there is nothing to switch off.
             updateLatestVersion: String(settings.updateLatestVersion || ''),
             // Which of the user's SillyTavern regex rules run over reference material.
             // Persistent by design: this answers "which of my rules make sense while
@@ -3317,9 +3315,8 @@
         return Boolean(latest) && compareVersions(latest, VERSION) > 0;
     }
 
-    // silent: the daily background check. A failure there is not the user's doing and
-    // says nothing about the editing they are in the middle of, so it stays quiet.
-    async function checkForUpdate({ silent = true } = {}) {
+    // Only ever runs because the user pressed 檢查更新. Nothing schedules this.
+    async function checkForUpdate() {
         if (state.update.checking) return;
         state.update.checking = true;
         state.update.error = '';
@@ -3330,22 +3327,15 @@
             if (!inspected.ok) throw new Error(inspected.error);
             state.update.latest = inspected.version;
             state.update.checked = true;
-            state.settings.updateCheckedAt = Date.now();
             state.settings.updateLatestVersion = inspected.version;
             saveSettings();
-            if (!silent) {
-                toast(inspected.newer ? 'success' : 'info', inspected.newer
-                    ? `有新版本 ${inspected.version}（目前 ${VERSION}）。`
-                    : `已經是最新版本（${VERSION}）。`);
-            }
+            toast(inspected.newer ? 'success' : 'info', inspected.newer
+                ? `有新版本 ${inspected.version}（目前 ${VERSION}）。`
+                : `已經是最新版本（${VERSION}）。`);
         } catch (error) {
             console.warn('[ST Inline AI Editor] Update check failed.', error);
             state.update.error = String(error?.message || error);
-            // A failed check still counts against the daily budget: retrying on every
-            // page load while offline would be a request storm nobody asked for.
-            state.settings.updateCheckedAt = Date.now();
-            saveSettings();
-            if (!silent) toast('error', `檢查更新失敗：${state.update.error}`);
+            toast('error', `檢查更新失敗：${state.update.error}`);
         } finally {
             state.update.checking = false;
             renderUpdateSection();
@@ -3427,12 +3417,6 @@
     // in the editor changes — an update is never urgent enough to interrupt an edit.
     function markToolbarUpdateBadge(session) {
         session?.settingsButton?.classList.toggle('stiae-has-update', updateAvailable());
-    }
-
-    function maybeCheckForUpdate() {
-        if (!state.settings.updateCheckEnabled) return;
-        if (Date.now() - state.settings.updateCheckedAt < UPDATE_CHECK_INTERVAL_MS) return;
-        checkForUpdate({ silent: true });
     }
 
     // ══════ 表單與設定視窗 ══════
@@ -3912,20 +3896,20 @@
         const checkUpdate = button('檢查更新', 'fa-rotate');
         const installUpdate = button('更新腳本', 'fa-download', 'stiae-primary');
         updateRow.append(checkUpdate, installUpdate);
-        const autoCheckLabel = createElement('label', 'stiae-checkbox');
-        const autoCheck = createElement('input');
-        autoCheck.type = 'checkbox';
-        autoCheck.checked = draft.updateCheckEnabled;
-        autoCheckLabel.append(autoCheck, createElement('span', '', '每天自動檢查一次有沒有新版'));
         const updateHelp = createElement(
             'div',
             'stiae-help',
             '更新換掉的是腳本庫裡這一支腳本的內容，不會新增第二份——所以你的設定、客製指令與世界書勾選全都留著，不必再複製貼上一次。換完要重新整理頁面才生效。',
         );
+        const updateNoAuto = createElement(
+            'div',
+            'stiae-help',
+            '這個工具不會自己去查有沒有新版。只有你按下「檢查更新」的那一刻它才連外網，其餘時間完全不連。',
+        );
         const updateRisk = createElement(
             'div',
             'stiae-help',
-            '更新來源固定是這個專案的 GitHub，抓下來的內容會先檢查過才寫入。但這仍等於允許那個 repo 的擁有者在你的瀏覽器裡執行程式碼——不放心就把自動檢查關掉，改用手動匯入。',
+            '更新來源固定是這個專案的 GitHub，抓下來的內容會先檢查過才寫入。但這仍等於允許那個 repo 的擁有者在你的瀏覽器裡執行程式碼——不放心就別按更新，改用手動匯入。',
         );
         const updateLink = createElement('div', 'stiae-help');
         const updateAnchor = createElement('a', '', '在 GitHub 上看變更說明');
@@ -3958,7 +3942,7 @@
         };
         state.updateRender = renderUpdate;
         renderUpdate();
-        checkUpdate.addEventListener('click', () => checkForUpdate({ silent: false }));
+        checkUpdate.addEventListener('click', () => checkForUpdate());
         installUpdate.addEventListener('click', () => runUpdate());
 
         // Persistent, and collapsed by default. The list can run to dozens of rows, and
@@ -4073,8 +4057,8 @@
             updateHeader,
             updateStatus,
             updateRow,
-            autoCheckLabel,
             updateHelp,
+            updateNoAuto,
             updateRisk,
             updateLink,
             updateUnsupported,
@@ -4103,12 +4087,9 @@
             draft.globalPrompt = prompt.value.trim() || DEFAULT_GLOBAL_PROMPT;
             const tokenValue = Number(tokens.value);
             draft.defaultMaxTokens = tokenValue >= 64 ? Math.round(tokenValue) : 2048;
-            draft.updateCheckEnabled = autoCheck.checked;
-            // ⚠️ Taken from the live settings, not from the draft. A check that finished
-            // while this dialog was open has already saved these two, and copying the
-            // draft's stale values over them would undo that check — the next page load
-            // would go and ask again.
-            draft.updateCheckedAt = state.settings.updateCheckedAt;
+            // ⚠️ Taken from the live settings, not from the draft. 檢查更新 lives in this
+            // same dialog and saves its result immediately; copying the draft's stale
+            // value over it would throw away the answer the user just asked for.
             draft.updateLatestVersion = state.settings.updateLatestVersion;
             return normalizeSettings(draft);
         };
@@ -4214,8 +4195,5 @@
         openSettings,
         core: TEST_API,
     };
-    // Fire and forget, once a day at most, and silent on failure. Nothing waits for it —
-    // the editor is fully usable whether or not GitHub answers.
-    maybeCheckForUpdate();
     console.info(`[ST Inline AI Editor] v${VERSION} ready.`);
 })(typeof window !== 'undefined' ? window : globalThis);
