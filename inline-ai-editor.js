@@ -884,18 +884,30 @@
         return { text: output, failed, applied };
     }
 
-    // A world info entry's uid is only unique inside its own book — the host's own type
-    // says so outright — so nothing may key on the uid alone. The separator is a NUL
-    // because a book name can contain anything a filename can.
     // ══════ 純函式：世界書條目 ══════
 
+    // A world info entry's uid is only unique inside its own book — the host's own type
+    // says so outright — so nothing may key on the uid alone.
+    //
+    // ⚠️ JSON, not a separator character. A book name can contain anything a filename can,
+    // so any single character picked as a separator can also appear inside a name, and
+    // then two different entries collide into one key — silently, showing as "ticked A,
+    // sent B". JSON.stringify escapes whatever the name contains, so no pair of inputs
+    // can produce the same output.
+    //
+    // Until 0.7.0 this was a NUL byte, which was collision-proof for the same reason but
+    // made the whole source file binary as far as grep, `file` and friends were concerned:
+    // `grep -c function inline-ai-editor.js` answered *nothing at all* rather than
+    // admitting it could not read the file. That is precisely the failure this project
+    // refuses to ship. Do not reintroduce a raw control character here.
     function worldbookEntryKey(book, uid) {
-        return `${String(book ?? '')} ${String(uid ?? '')}`;
+        return JSON.stringify([String(book ?? ''), String(uid ?? '')]);
     }
 
     // The stored form is { book, uid } rather than the joined key, because settings are
-    // user-facing: they travel through the copy/paste backup, and a NUL byte sitting in
-    // the middle of a string there looks like corruption.
+    // user-facing: they travel through the copy/paste backup, where a joined key would be
+    // one opaque string instead of two readable fields. It also means changing the key
+    // format — as 0.7.0 did — cannot invalidate anyone's saved picks.
     function normalizeWorldbookRef(raw) {
         const book = String(raw?.book ?? '');
         const uid = worldbookUid(raw?.uid);
@@ -3347,6 +3359,16 @@
         }
     }
 
+    // ⚠️ This call ends this script's life. Verified against TavernHelper's source
+    // (src/function/script.ts, src/store/iframe_runtimes/script.ts, src/panel/Script.vue):
+    // replaceScriptTrees writes into the Pinia store, the `runtimes` computed carries
+    // `content`, and <Iframe :content> turns it into the iframe's srcdoc — so changing
+    // content reloads the iframe immediately. That is exactly what we want (no page
+    // refresh needed), but it means **nothing after this call can be relied on**: dialogs
+    // are drawn by this realm, and this realm is about to be replaced.
+    //
+    // So: ask everything before, and afterwards only toast() — toastr lives in the parent
+    // window and outlives us.
     async function writeSelfSource(location, source) {
         await tavern.updateScriptTreesWith(trees => (trees || []).map(node => {
             if (node?.type === 'folder') {
@@ -3388,11 +3410,19 @@
             renderUpdateSection();
         }
 
+        // ⚠️ Everything the user must be told has to be said HERE, before the write.
+        // Writing the new source makes TavernHelper reload this very script, and this
+        // script is what draws the dialogs — see the note above writeSelfSource().
+        const editor = state.activeEditor;
+        const unsaved = editor && editor.textarea.value !== editor.baseText
+            ? `\n\n⚠️ 第 ${editor.messageId} 樓的編輯器有還沒儲存的修改，重新載入會讓它消失。要先存檔就按取消。`
+            : '';
         const confirmed = await showConfirm(
             `要把這支腳本從 ${VERSION} 換成 ${version} 嗎？\n\n`
             + '換的是腳本庫裡這一支的內容，不是新增一份，所以你的設定全部留著：Connection Profile、編輯原則、內建指令的修改、客製指令與分組、世界書勾選。\n\n'
-            + '換完之後要重新整理頁面才會生效。',
-            { confirmLabel: `更新到 ${version}` },
+            + '換完之後酒館助手會自己重新載入這個腳本，開著的編輯器與設定視窗會關閉。'
+            + unsaved,
+            { confirmLabel: `更新到 ${version}`, danger: Boolean(unsaved) },
         );
         if (!confirmed) return;
 
@@ -3403,14 +3433,11 @@
             toast('error', `寫入新版失敗：${String(error?.message || error)}。目前的腳本沒有被動到。`);
             return;
         }
-        state.settings.updateLatestVersion = version;
-        saveSettings();
-        const reload = await showConfirm(
-            `已經換成 ${version}。要現在重新整理頁面讓它生效嗎？\n\n`
-            + '⚠️ 編輯器裡尚未儲存的草稿會消失。想先存檔的話按取消，稍後自己重新整理即可。',
-            { confirmLabel: '重新整理' },
-        );
-        if (reload) hostWindow.location.reload();
+        // toastr belongs to the parent window, so this survives our own iframe being torn
+        // down — unlike a dialog, which is drawn by the code that is about to stop
+        // existing. The fallback sentence covers a host that does not reload on its own;
+        // saying "已完成" with no way to tell would be the worse failure.
+        toast('success', `已更新到 ${version}。腳本正在重新載入——若過幾秒沒有反應，重新整理頁面即可。`);
     }
 
     function renderUpdateSection() {
