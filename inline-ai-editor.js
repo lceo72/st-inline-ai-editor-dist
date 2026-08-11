@@ -39,7 +39,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.7.1';
+    const VERSION = '0.7.2';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -1465,7 +1465,11 @@
             .stiae-group-spacer { flex: 1; }
             .stiae-group-action { min-height: 24px !important; padding: 1px 6px !important; opacity: .75; }
             .stiae-group-action:hover { opacity: 1; }
+            /* Four columns: handle, icon, name, actions. A row without a handle must say
+               so — see .stiae-command-row-plain — or its three children fill the first
+               three columns and the buttons end up in the middle. */
             .stiae-command-row { display: grid; grid-template-columns: auto auto minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--stiae-border); border-radius: 7px; }
+            .stiae-command-row-plain { grid-template-columns: auto minmax(0,1fr) auto; }
             /* Reordering is by dragging on desktop and by arrows on touch — never both at
                once, because two ways to do the same thing in one row is just clutter. */
             .stiae-move-button { display: none !important; }
@@ -3916,7 +3920,12 @@
         const renderBuiltins = () => {
             builtinList.replaceChildren();
             for (const command of resolveCommands(draft).builtins) {
-                const row = createElement('div', 'stiae-command-row');
+                // ⚠️ -plain because a builtin has no drag handle: builtins are not
+                // reorderable and not groupable (產品決策 6). The grid is four columns for
+                // a custom command's handle, and a three-child row silently fills the
+                // wrong ones — the action buttons land in the flexible column and huddle
+                // against the name with the right half of the row left empty.
+                const row = createElement('div', 'stiae-command-row stiae-command-row-plain');
                 const icon = createElement('i', `fa-solid ${command.icon}`);
                 const name = createElement('div');
                 name.append(createElement('strong', '', command.name));
