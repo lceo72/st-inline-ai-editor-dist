@@ -39,7 +39,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.7.0';
+    const VERSION = '0.7.1';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -199,20 +199,36 @@
     }
 
     // Groups are a view of the stored order, not a second ordering to keep in step with
-    // it. Commands of the same group are gathered together and the groups themselves run
-    // in the order they first appear, so the settings list, the ⋯ menu and the up/down
-    // buttons can never disagree about what comes after what.
+    // it. A named group's members are gathered to wherever its first member sits, so a
+    // folder is always contiguous — that is what makes it a folder.
     //
-    // The sort must stay stable: within a group the author's own order is the answer, and
-    // this runs on every normalizeSettings() — an unstable sort would shuffle the list on
-    // its own every time it was saved.
+    // ⚠️ Ungrouped commands are NOT a group and are left exactly where they are. Treating
+    // "" as one more group looks tidy and is wrong in use: it welds every loose command
+    // into a single block, so there is no way to put one between two folders, or in front
+    // of one. A loose command has to be free to sit anywhere in the row, like a bookmark
+    // that is not in a folder.
+    //
+    // Order is otherwise preserved exactly, and it must be: this runs on every
+    // normalizeSettings(), so anything unstable here would reshuffle the user's list a
+    // little more on each save.
     function sortCommandsByGroup(commands) {
-        const seen = [];
+        const result = [];
+        const placed = new Set();
         for (const command of commands) {
+            if (placed.has(command)) continue;
             const group = command?.group || '';
-            if (!seen.includes(group)) seen.push(group);
+            if (!group) {
+                result.push(command);
+                placed.add(command);
+                continue;
+            }
+            for (const member of commands) {
+                if (placed.has(member) || (member?.group || '') !== group) continue;
+                result.push(member);
+                placed.add(member);
+            }
         }
-        return commands.slice().sort((a, b) => seen.indexOf(a?.group || '') - seen.indexOf(b?.group || ''));
+        return result;
     }
 
     function commandGroupNames(commands) {
@@ -386,10 +402,10 @@
             return { ok: false, error: '這段文字不是有效的設定資料，無法解析。請確認整段都複製到了。' };
         }
         if (payload?.format === COMMANDS_EXPORT_FORMAT) {
-            return { ok: false, error: '這是「客製指令」的匯出檔，不是整包設定。請改用客製指令那一區的「貼上指令」。' };
+            return { ok: false, error: '這是「客製指令」的匯出檔，不是整包設定。請改用客製指令那一區的「匯入指令代碼」。' };
         }
         if (!payload || typeof payload !== 'object' || payload.format !== SETTINGS_EXPORT_FORMAT) {
-            return { ok: false, error: '這不是 AI 內文編輯器的設定。請貼上「複製設定」產生的文字。' };
+            return { ok: false, error: '這不是 AI 內文編輯器的設定。請貼上「複製設定代碼」產生的文字。' };
         }
         if (!payload.settings || typeof payload.settings !== 'object') {
             return { ok: false, error: '設定資料缺少內容，可能複製時被截斷了。' };
@@ -431,10 +447,10 @@
             return { ok: false, error: '這段文字不是有效的指令資料，無法解析。請確認整段都複製到了。' };
         }
         if (payload?.format === SETTINGS_EXPORT_FORMAT) {
-            return { ok: false, error: '這是整包設定的備份，不是客製指令。請改用「設定備份」那一區的「貼上設定」。' };
+            return { ok: false, error: '這是整包設定的備份，不是客製指令。請改用「設定備份」那一區的「匯入設定代碼」。' };
         }
         if (!payload || typeof payload !== 'object' || payload.format !== COMMANDS_EXPORT_FORMAT) {
-            return { ok: false, error: '這不是 AI 內文編輯器的客製指令。請貼上「複製指令」產生的文字。' };
+            return { ok: false, error: '這不是 AI 內文編輯器的客製指令。請貼上「複製指令代碼」產生的文字。' };
         }
         if (!Array.isArray(payload.commands)) {
             return { ok: false, error: '指令資料缺少內容，可能複製時被截斷了。' };
@@ -1293,12 +1309,32 @@
             .stiae-close:hover { opacity: 1; }
             .stiae-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; padding: 9px 12px; border-bottom: 1px solid var(--stiae-border); overflow-x: auto; }
             .stiae-toolbar-spacer { flex: 1; }
-            .stiae-button { display: inline-flex !important; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; min-height: 34px; }
+            /* ⚠️ box-sizing matters here, and not for tidiness. This class lands on both
+               <button> and <summary>: a button is border-box by default, a summary is
+               content-box, so the same min-height made every dropdown 14px taller than
+               the plain buttons beside it. The ⋯ menu has been the odd one out since
+               0.6.1 for this reason; the group folders made it obvious. */
+            .stiae-button { display: inline-flex !important; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; min-height: 34px; box-sizing: border-box; }
             .stiae-icon-button span { display: none; }
+            /* A folder is a container, not another action, so it reads one notch quieter
+               than the commands beside it — same size, same shape, just the icon carrying
+               the theme accent and the whole button slightly held back until you reach
+               for it. Making it *bigger* was the first attempt and it looked bolted on. */
+            .stiae-folder { opacity: .82; }
+            .stiae-folder:hover, details[open] > .stiae-folder { opacity: 1; }
+            .stiae-folder i { color: var(--stiae-accent); }
             .stiae-more { position: relative; }
             .stiae-more > summary { list-style: none; cursor: pointer; }
             .stiae-more > summary::-webkit-details-marker { display: none; }
-            .stiae-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 3; min-width: 190px; max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 7px; background: var(--stiae-bg); border: 1px solid var(--stiae-border); border-radius: 7px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+            /* ⚠️ fixed, not absolute — and that is not a style preference.
+               .stiae-toolbar carries overflow-x: auto so the buttons can scroll sideways
+               on a phone. Per spec, an overflow of auto on one axis turns "visible" on the
+               other axis into auto too, which makes the toolbar a scroll container that
+               CLIPS anything positioned out of it. An absolutely positioned menu therefore
+               lost everything below the toolbar's bottom edge: measured 222px tall, 4px
+               visible. Fixed positioning escapes the clip; positionToolbarMenu() supplies
+               the coordinates, since fixed no longer follows the button on its own. */
+            .stiae-menu { position: fixed; z-index: 45100; min-width: 190px; max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 7px; background: var(--stiae-bg); border: 1px solid var(--stiae-border); border-radius: 7px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
             .stiae-menu .stiae-button { width: 100%; justify-content: flex-start; }
             .stiae-mobile-menu-item { display: none !important; }
             .stiae-scope { flex: 0 0 auto; padding: 7px 13px; color: var(--stiae-muted); border-bottom: 1px solid var(--stiae-border); font-size: .9em; }
@@ -1412,13 +1448,36 @@
             .stiae-field textarea { min-height: 92px; resize: vertical; }
             .stiae-field textarea.stiae-payload-text { min-height: 170px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
             .stiae-command-list { display: flex; flex-direction: column; gap: 7px; }
-            .stiae-command-group { margin-top: 7px; padding-bottom: 2px; border-bottom: 1px solid var(--stiae-border); color: var(--stiae-muted); font-size: .88em; font-weight: 700; }
-            .stiae-command-group:first-child { margin-top: 0; }
-            .stiae-menu-group { padding: 6px 6px 2px; color: var(--stiae-muted); font-size: .82em; font-weight: 700; }
-            /* Pairs with .stiae-mobile-menu-item: a group whose commands are all pinned
-               to the toolbar has nothing under it on desktop, so its heading goes too. */
-            .stiae-menu-group-mobile { display: none; }
-            .stiae-command-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--stiae-border); border-radius: 7px; }
+            /* A group is a box around its commands. A heading with a rule under it was not
+               enough once the 未分組 heading went away: with nothing marking where a group
+               ends, the list read as one flat run and there was no way to tell a grouped
+               command from a loose one. */
+            .stiae-group-box { display: flex; flex-direction: column; gap: 7px; padding: 8px 9px 9px; border: 1px solid var(--stiae-border); border-radius: 8px; background: rgba(127,127,127,.06); }
+            /* ⚠️ Fixed height, always. These gaps used to be display:none and appear on
+               dragstart — which pushed the list open the instant you pressed down: the
+               row being dragged jumped 38px and the list grew 113px, so every drop target
+               was somewhere other than where it had been aimed at. Dragging became
+               impossible. Nothing here may change the layout; only the colours change. */
+            .stiae-loose-zone { height: 14px; margin: -3px 0; box-sizing: border-box; overflow: hidden; border: 1px dashed transparent; border-radius: 6px; color: transparent; font-size: .72em; line-height: 12px; text-align: center; }
+            .stiae-command-list.stiae-dragging-command .stiae-loose-zone { border-color: var(--stiae-border); color: var(--stiae-muted); }
+            .stiae-loose-zone.stiae-drop-target { border-color: var(--stiae-accent); background: rgba(127,127,127,.14); color: var(--stiae-fg); outline: none; }
+            .stiae-command-group { display: flex; align-items: center; gap: 4px; padding-bottom: 6px; border-bottom: 1px solid var(--stiae-border); color: var(--stiae-muted); font-size: .88em; font-weight: 700; }
+            .stiae-group-spacer { flex: 1; }
+            .stiae-group-action { min-height: 24px !important; padding: 1px 6px !important; opacity: .75; }
+            .stiae-group-action:hover { opacity: 1; }
+            .stiae-command-row { display: grid; grid-template-columns: auto auto minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--stiae-border); border-radius: 7px; }
+            /* Reordering is by dragging on desktop and by arrows on touch — never both at
+               once, because two ways to do the same thing in one row is just clutter. */
+            .stiae-move-button { display: none !important; }
+            .stiae-drag-grip { color: var(--stiae-muted); cursor: grab; opacity: .7; }
+            .stiae-command-row:active .stiae-drag-grip { cursor: grabbing; }
+            .stiae-dragging { opacity: .45; }
+            /* Two different meanings, two different signals: a line on one edge is a
+               position (it will land against that edge), a dashed outline is a container
+               (it will land inside). */
+            .stiae-drop-target { outline: 2px dashed var(--stiae-accent); outline-offset: 2px; }
+            .stiae-drop-before { box-shadow: inset 0 3px 0 var(--stiae-accent); }
+            .stiae-drop-after { box-shadow: inset 0 -3px 0 var(--stiae-accent); }
             .stiae-command-row-actions { display: flex; gap: 4px; }
             .stiae-command-row-actions button { min-width: 34px; }
             .stiae-inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1439,8 +1498,12 @@
                 .stiae-header { cursor: default; }
                 .stiae-desktop-pin { display: none !important; }
                 .stiae-mobile-menu-item { display: inline-flex !important; }
-                .stiae-menu-group-mobile { display: block; }
                 .stiae-diff-tabs { display: flex; }
+                /* HTML5 drag-and-drop does not fire on touch, so the handle would be a
+                   button that does nothing — the arrows take over here instead. */
+                .stiae-drag-grip { display: none; }
+                .stiae-move-button { display: inline-flex !important; }
+                .stiae-command-row { grid-template-columns: auto minmax(0,1fr) auto; }
                 /* One text column at a time, chosen by the tabs. The gutter stays,
                    so a change can still be declined without switching sides. */
                 .stiae-diff-grid { grid-template-columns: minmax(0,1fr); }
@@ -1811,6 +1874,9 @@
         let drag = null;
         const down = event => {
             if (hostWindow.innerWidth <= 760 || event.target.closest('button')) return;
+            // The ⋯ menu is fixed-positioned and placed once, when it opens. Dragging the
+            // window out from under it would leave it hanging in mid-air.
+            closeDetailsMenus(modal);
             const rect = modal.getBoundingClientRect();
             drag = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
             handle.setPointerCapture?.(event.pointerId);
@@ -2330,7 +2396,7 @@
         const help = createElement(
             'div',
             'stiae-help',
-            '一次挑一本，勾好再換下一本。搜尋會跨全部世界書（第一次要多等一下）。唯讀、會記住，關掉這個視窗就生效。',
+            '一次挑一本；搜尋會跨全部世界書。唯讀、會記住，關掉就生效。',
         );
         const notes = createElement('div', 'stiae-reference-notes');
         const selected = createElement('div', 'stiae-wb-selected');
@@ -2426,7 +2492,7 @@
         const help = createElement(
             'div',
             'stiae-help',
-            '唯讀，不會被寫回聊天。會記住；換到別的聊天就清空。',
+            '唯讀，不會寫回聊天。換聊天就清空。',
         );
         const notes = createElement('div', 'stiae-reference-notes');
         const list = createElement('div', 'stiae-reference-list');
@@ -2544,6 +2610,46 @@
         for (const detail of container.querySelectorAll('details[open]')) detail.removeAttribute('open');
     }
 
+    // The menu is position: fixed (see the stylesheet for why), so it no longer follows
+    // the button it belongs to — these coordinates are what put it back under it.
+    // Recomputed on every open rather than once, because the editor window can be dragged
+    // and resized between one open and the next.
+    function positionToolbarMenu(anchor, menu) {
+        const rect = anchor.getBoundingClientRect();
+        menu.style.top = `${Math.round(rect.bottom + 6)}px`;
+        // Right-aligned with the button, but never off the left edge of the viewport.
+        const fromRight = Math.round(hostWindow.innerWidth - rect.right);
+        menu.style.right = `${Math.min(Math.max(fromRight, 8), Math.max(8, hostWindow.innerWidth - 200))}px`;
+        // Whatever room is left below the button. Without this the menu would simply run
+        // off the bottom of a short window — the clipping bug in a different costume.
+        menu.style.maxHeight = `${Math.max(140, Math.round(hostWindow.innerHeight - rect.bottom - 22))}px`;
+    }
+
+    // One dropdown, used both for a group's folder and for the ⋯ overflow menu.
+    // pinnedCount says how many of these commands are already pinned to the toolbar as
+    // separate buttons: those get .stiae-mobile-menu-item so desktop hides the duplicate
+    // while mobile — which has no pins — still lists them.
+    function buildCommandMenu(session, label, icon, commands, { pinnedCount = 0, folder = false } = {}) {
+        const details = createElement('details', 'stiae-more');
+        const summary = createElement('summary', `menu_button stiae-button${folder ? ' stiae-folder' : ''}`);
+        summary.append(createElement('i', `fa-solid ${icon}`));
+        summary.append(createElement('span', '', label));
+        const menu = createElement('div', 'stiae-menu');
+        commands.forEach((command, index) => {
+            const item = button(command.name, command.icon, index < pinnedCount ? 'stiae-mobile-menu-item' : '');
+            item.addEventListener('click', () => {
+                details.removeAttribute('open');
+                runAiAction(session, command);
+            });
+            menu.append(item);
+        });
+        details.addEventListener('toggle', () => {
+            if (details.open) positionToolbarMenu(summary, menu);
+        });
+        details.append(summary, menu);
+        return details;
+    }
+
     function renderEditorToolbar(session) {
         const toolbar = session.toolbar;
         toolbar.replaceChildren();
@@ -2556,54 +2662,52 @@
         }
 
         const visibleCommands = customs.filter(command => command.visible && command.instruction.trim());
-        const pinned = visibleCommands.slice(0, 3);
-        for (const command of pinned) {
+
+        // A group is a folder button on the toolbar, not a heading buried inside ⋯.
+        // 0.7.0 first shipped it as headings in the ⋯ menu and it was invisible in
+        // practice: the toolbar looked exactly like an ungrouped one, so grouping seemed
+        // not to work at all. A folder you can point at is the whole value of grouping.
+        const folders = new Map();
+        const loose = [];
+        for (const command of visibleCommands) {
+            if (!command.group) {
+                loose.push(command);
+                continue;
+            }
+            if (!folders.has(command.group)) folders.set(command.group, []);
+            folders.get(command.group).push(command);
+        }
+
+        // ⚠️ Laid out in the stored order, NOT folders-then-loose. The toolbar reads like
+        // a browser's bookmarks bar, so where a thing sits has to be the owner's decision:
+        // a folder appears where its first member sits, and dragging that member in the
+        // settings list is how you move the folder. Hard-coding folders to the left made
+        // the order look arbitrary — because it was.
+        const placedFolders = new Set();
+        let pinnedLoose = 0;
+        for (const command of visibleCommands) {
+            const group = command.group || '';
+            if (group) {
+                if (placedFolders.has(group)) continue;
+                placedFolders.add(group);
+                toolbar.append(buildCommandMenu(session, group, 'fa-folder', folders.get(group), { folder: true }));
+                continue;
+            }
+            // Ungrouped commands keep the 0.6.1 behaviour exactly: the first three pinned
+            // on desktop, all of them in ⋯. Someone who never groups sees no change.
+            if (pinnedLoose >= 3) continue;
+            pinnedLoose += 1;
             const item = button(command.name, command.icon, 'stiae-desktop-pin');
             item.addEventListener('click', () => runAiAction(session, command));
             toolbar.append(item);
         }
-
-        if (visibleCommands.length) {
-            const more = createElement('details', 'stiae-more');
-            const summary = createElement('summary', 'menu_button stiae-button');
-            summary.append(createElement('i', 'fa-solid fa-ellipsis'));
-            summary.append(createElement('span', '', '更多'));
-            const menu = createElement('div', 'stiae-menu');
-            const grouped = commandGroupNames(visibleCommands).length > 0;
-            // On desktop the first three are hidden in this menu because they are already
-            // pinned to the toolbar. A group made up entirely of those would leave its
-            // heading standing over nothing, so such a heading is mobile-only too.
-            const groupShowsOnDesktop = new Set();
-            visibleCommands.forEach((command, index) => {
-                if (index >= 3) groupShowsOnDesktop.add(command.group || '');
-            });
-            let lastGroup = null;
-            visibleCommands.forEach((command, index) => {
-                const group = command.group || '';
-                if (grouped && group !== lastGroup) {
-                    const heading = createElement(
-                        'div',
-                        `stiae-menu-group${groupShowsOnDesktop.has(group) ? '' : ' stiae-menu-group-mobile'}`,
-                        group || '未分組',
-                    );
-                    menu.append(heading);
-                }
-                lastGroup = group;
-                // ⚠️ index is the position in the whole visible list, never within the
-                // group. The first three commands are rendered twice — as pinned buttons
-                // and as menu items — and .stiae-desktop-pin / .stiae-mobile-menu-item
-                // hide one copy each by media query. Counting per group here would pin
-                // the wrong ones and show duplicates on desktop.
-                const classes = index < 3 ? 'stiae-mobile-menu-item' : '';
-                const item = button(command.name, command.icon, classes);
-                item.addEventListener('click', () => {
-                    more.removeAttribute('open');
-                    runAiAction(session, command);
-                });
-                menu.append(item);
-            });
-            more.append(summary, menu);
-            toolbar.append(more);
+        if (loose.length) {
+            const overflow = buildCommandMenu(session, '更多', 'fa-ellipsis', loose, { pinnedCount: 3 });
+            // With three or fewer ungrouped commands they are all pinned already, so on
+            // desktop this menu would open onto nothing. Mobile has no pins, so it still
+            // needs it. (Present since 0.6.1; the folders just made it easy to see.)
+            if (loose.length <= 3) overflow.classList.add('stiae-mobile-menu-item');
+            toolbar.append(overflow);
         }
 
         const custom = button('臨時指令', 'fa-comment-dots');
@@ -3523,6 +3627,43 @@
         });
     }
 
+    // Returns the new name, or null if cancelled. Blank is refused — an empty name would
+    // silently mean "ungroup everything in here", which is what 解散 is for.
+    function showGroupNameForm(current, existingNames) {
+        return showSimpleForm('重新命名分組', form => {
+            const field = createElement('div', 'stiae-field');
+            field.append(createElement('label', '', '分組名稱'));
+            const input = createElement('input');
+            input.name = 'name';
+            input.required = true;
+            input.value = current;
+            const others = existingNames.filter(name => name !== current);
+            field.append(input, createElement(
+                'div',
+                'stiae-help',
+                others.length
+                    ? `改成既有的名字會把兩組併在一起。目前的其他分組：${others.join('、')}。`
+                    : '這是目前唯一的分組。',
+            ));
+            form.append(field);
+            hostWindow.setTimeout(() => { input.focus(); input.select(); }, 0);
+        }, form => {
+            const name = form.elements.name.value.trim();
+            if (!name) return undefined;
+            return name;
+        });
+    }
+
+    // The select carries existing groups; 建立新分組 reveals a text field beside it. The
+    // builtin form has neither, and that is not the same as choosing 不分組 — it means
+    // "leave whatever was there alone".
+    function readGroupFromForm(form, fallback) {
+        const select = form.elements.group;
+        if (!select) return fallback;
+        if (select.selectedOptions[0]?.dataset.new === '1') return String(form.elements.newGroup?.value ?? '').trim();
+        return select.value;
+    }
+
     async function showCommandForm(existing, isBuiltin = false, groupNames = []) {
         const command = existing ? clone(existing) : normalizeCommand({ name: '', instruction: '', visible: true }, state.settings.commands.length);
         const title = isBuiltin ? '編輯內建指令' : (existing ? '編輯客製指令' : '新增客製指令');
@@ -3531,7 +3672,7 @@
                 form.append(createElement(
                     'div',
                     'stiae-help',
-                    '這是內建指令。一旦儲存，它就完全照你寫的走——日後版本更新不會再改動它。想拿回出廠內容，用列表上的「還原預設」。',
+                    '儲存後它就完全照你寫的走，日後更新不會再改動它。要拿回出廠內容按「還原預設」。',
                 ));
             }
             const nameField = createElement('div', 'stiae-field');
@@ -3544,23 +3685,45 @@
 
             // Builtins are deliberately left out of grouping: they keep an identity of
             // their own and are never folded into the custom list (ADR-0001).
+            //
+            // ⚠️ A <select> of existing groups, not a text field. A free-text box makes a
+            // typo silently create a second group that looks identical — "對白" and "對白 "
+            // are two folders, and nothing tells you which one you just filed this under.
+            // Typing is only reachable through the explicit 建立新分組 option.
             const groupField = createElement('div', 'stiae-field');
+            const newGroupField = createElement('div', 'stiae-field stiae-hidden');
             if (!isBuiltin) {
-                groupField.append(createElement('label', '', '分組（選填）'));
-                const group = createElement('input');
+                groupField.append(createElement('label', '', '分組'));
+                const group = createElement('select');
                 group.name = 'group';
-                group.value = command.group;
-                group.placeholder = '留空＝不分組。打一個新名字就會開一個新的組。';
-                const listId = makeId('groups');
-                const datalist = createElement('datalist');
-                datalist.id = listId;
+                const none = createElement('option', '', '（不分組）');
+                none.value = '';
+                group.append(none);
                 for (const name of groupNames) {
-                    const option = createElement('option');
+                    const option = createElement('option', '', name);
                     option.value = name;
-                    datalist.append(option);
+                    group.append(option);
                 }
-                group.setAttribute('list', listId);
-                groupField.append(group, datalist, createElement('div', 'stiae-help', '同一組的指令會排在一起，⋯ 選單裡也會分段。'));
+                const create = createElement('option', '', '＋ 建立新分組…');
+                // Marked by a data attribute rather than a magic value: any sentinel string
+                // is a group name someone could legitimately type.
+                create.dataset.new = '1';
+                create.value = '';
+                group.append(create);
+                group.value = command.group;
+                groupField.append(group, createElement('div', 'stiae-help', '同組的指令會收在工具列的同一個資料夾按鈕裡。'));
+
+                newGroupField.append(createElement('label', '', '新分組的名字'));
+                const newGroup = createElement('input');
+                newGroup.name = 'newGroup';
+                newGroup.placeholder = '例如：對白';
+                newGroupField.append(newGroup);
+
+                group.addEventListener('change', () => {
+                    const creating = group.selectedOptions[0]?.dataset.new === '1';
+                    newGroupField.classList.toggle('stiae-hidden', !creating);
+                    if (creating) newGroup.focus();
+                });
             }
 
             const row = createElement('div', 'stiae-inline-fields');
@@ -3629,7 +3792,7 @@
             visible.type = 'checkbox';
             visible.checked = command.visible;
             visibleLabel.append(visible, createElement('span', '', '顯示在編輯器指令列'));
-            form.append(nameField, groupField, row, instructionField, systemField, advanced, visibleLabel);
+            form.append(nameField, groupField, newGroupField, row, instructionField, systemField, advanced, visibleLabel);
             hostWindow.setTimeout(() => name.focus(), 0);
         }, form => {
             const name = form.elements.name.value.trim();
@@ -3640,7 +3803,7 @@
                 ...command,
                 name,
                 // The field is absent for builtins, which is not the same as it being blank.
-                group: form.elements.group ? form.elements.group.value : command.group,
+                group: readGroupFromForm(form, command.group),
                 icon: form.elements.icon.value,
                 instruction,
                 mode: form.elements.mode.value,
@@ -3659,7 +3822,7 @@
     function showPayloadExport(title, text) {
         return showSimpleForm(title, form => {
             const field = createElement('div', 'stiae-field');
-            field.append(createElement('label', '', '備份文字'));
+            field.append(createElement('label', '', '代碼'));
             const area = createElement('textarea', 'stiae-payload-text');
             area.value = text;
             area.readOnly = true;
@@ -3670,14 +3833,14 @@
     }
 
     function showSettingsImport() {
-        return showSimpleForm('貼上設定', form => {
+        return showSimpleForm('匯入設定代碼', form => {
             const field = createElement('div', 'stiae-field');
-            field.append(createElement('label', '', '設定文字'));
+            field.append(createElement('label', '', '設定代碼'));
             const area = createElement('textarea', 'stiae-payload-text');
             area.name = 'payload';
             area.required = true;
-            area.placeholder = '把「複製設定」產生的文字貼在這裡。';
-            field.append(area, createElement('div', 'stiae-help', '匯入會覆蓋目前全部設定：Connection Profile、全域編輯原則、內建指令的修改與所有客製指令。'));
+            area.placeholder = '把「複製設定代碼」產生的文字貼在這裡。';
+            field.append(area, createElement('div', 'stiae-help', '會覆蓋目前全部設定。'));
             form.append(field);
             hostWindow.setTimeout(() => area.focus(), 0);
         }, form => {
@@ -3692,14 +3855,14 @@
     }
 
     function showCommandsImport() {
-        return showSimpleForm('貼上客製指令', form => {
+        return showSimpleForm('匯入指令代碼', form => {
             const field = createElement('div', 'stiae-field');
-            field.append(createElement('label', '', '指令文字'));
+            field.append(createElement('label', '', '指令代碼'));
             const area = createElement('textarea', 'stiae-payload-text');
             area.name = 'payload';
             area.required = true;
-            area.placeholder = '把「複製指令」產生的文字貼在這裡。';
-            field.append(area, createElement('div', 'stiae-help', '匯入是「加進去」：你現有的客製指令一條都不會被刪掉或覆蓋。同名的兩條都會留著，由你自己決定要刪哪一條。'));
+            area.placeholder = '把「複製指令代碼」產生的文字貼在這裡。';
+            field.append(area, createElement('div', 'stiae-help', '加進去，不覆蓋。同名的兩條都會留著。'));
             form.append(field);
             hostWindow.setTimeout(() => area.focus(), 0);
         }, form => {
@@ -3796,6 +3959,80 @@
         const commandList = createElement('div', 'stiae-command-list');
         const addCommand = button('新增客製指令', 'fa-plus');
 
+        // Drag and drop moves a command and, when it lands in another group, re-files it.
+        // The up/down arrows stay: HTML5 drag-and-drop does not work on touch, and this
+        // dialog has to remain fully usable on a phone.
+        // Exactly one of these is set while a drag is in flight: a single command by its
+        // index, or a whole group by its name.
+        let dragFrom = null;
+        let dragGroup = null;
+
+        // A line on the edge the thing will land against, rather than lighting up the
+        // whole target: with an `after` flag in play, "which side" is the part you need
+        // to see before letting go.
+        const markDropEdge = (element, after) => {
+            element.classList.toggle('stiae-drop-after', after);
+            element.classList.toggle('stiae-drop-before', !after);
+        };
+        const clearDropEdge = element => {
+            element.classList.remove('stiae-drop-before', 'stiae-drop-after');
+        };
+
+        // ⚠️ Every drop takes an `after` flag, decided by which half of the target the
+        // pointer is over. Without it every landing spot means "in front of this", and
+        // then nothing can ever reach the last position — a group could not be moved
+        // below the loose commands except by dragging those commands one at a time.
+        const dropsAfter = (event, element) => {
+            const rect = element.getBoundingClientRect();
+            return event.clientY > rect.top + rect.height / 2;
+        };
+
+        // targetGroup null means "keep whatever group it already has" — that is the
+        // heading drop, which is about position only. A string (including '') re-files it.
+        const dropCommandAt = (targetIndex, targetGroup, after = false) => {
+            if (dragFrom === null) return;
+            const wanted = after ? targetIndex + 1 : targetIndex;
+            const [moved] = draft.commands.splice(dragFrom, 1);
+            // Splicing the source out shifts everything after it down by one.
+            const insertAt = wanted > dragFrom ? wanted - 1 : wanted;
+            if (targetGroup !== null) moved.group = targetGroup;
+            draft.commands.splice(insertAt, 0, moved);
+            dragFrom = null;
+            renderCommands();
+        };
+
+        // Where a group should land relative to `target`. A group is a contiguous block,
+        // so "after a member of group X" means after the whole of X — dropping a folder
+        // into the middle of another folder is not a thing anyone means.
+        const insertIndexFor = (rest, target, after) => {
+            const index = rest.indexOf(target);
+            if (index < 0) return rest.length;
+            const group = target.group || '';
+            if (!group) return after ? index + 1 : index;
+            if (!after) return rest.findIndex(command => (command.group || '') === group);
+            let last = index;
+            rest.forEach((command, position) => {
+                if ((command.group || '') === group) last = position;
+            });
+            return last + 1;
+        };
+
+        // Moving a group moves every command in it, keeping their order. The toolbar
+        // places a folder where its first member sits, so this is also how the folder is
+        // moved along the toolbar.
+        const dropGroupAt = (targetIndex, after) => {
+            if (dragGroup === null) return;
+            // targetIndex may be one past the end: that is the gap after the last item.
+            const target = draft.commands[targetIndex];
+            if (target && (target.group || '') === dragGroup) return;
+            const members = draft.commands.filter(command => (command.group || '') === dragGroup);
+            const rest = draft.commands.filter(command => (command.group || '') !== dragGroup);
+            rest.splice(target ? insertIndexFor(rest, target, after) : rest.length, 0, ...members);
+            draft.commands = rest;
+            dragGroup = null;
+            renderCommands();
+        };
+
         const renderCommands = () => {
             // Re-sorted on every render rather than only on save: a command that just had
             // its group changed has to move to that group now, or the up/down buttons
@@ -3803,19 +4040,155 @@
             draft.commands = sortCommandsByGroup(draft.commands);
             commandList.replaceChildren();
             if (!draft.commands.length) commandList.append(createElement('div', 'stiae-help', '尚未建立客製指令。'));
-            // Headings only once there is a real group. A list where everything is
-            // ungrouped is every pre-0.7.0 setup, and it should look untouched.
             const grouped = commandGroupNames(draft.commands).length > 0;
             let lastGroup = null;
+            // A group's rows live inside a box; a loose command is a bare row on the page.
+            // Before this, a group was only a heading with a rule under it, and once the
+            // 未分組 heading was dropped there was nothing left to say where a group ended
+            // — the list read as one flat run of commands.
+            let groupBox = null;
             draft.commands.forEach((command, index) => {
                 const group = command.group || '';
-                if (grouped && group !== lastGroup) {
-                    commandList.append(createElement('div', 'stiae-command-group', group || '未分組'));
+                // ⚠️ A heading only for a real group. There is deliberately no 未分組
+                // heading: loose commands are not a block, they are individual items that
+                // can sit anywhere in the list — including between two folders.
+                if (group && group !== lastGroup) {
+                    const heading = createElement('div', 'stiae-command-group');
+                    const groupGrip = createElement('span', 'stiae-drag-grip');
+                    groupGrip.append(createElement('i', 'fa-solid fa-grip-vertical'));
+                    groupGrip.title = '拖曳整組換位置';
+                    heading.append(groupGrip);
+                    heading.draggable = true;
+                    heading.addEventListener('dragstart', event => {
+                        dragGroup = group;
+                        dragFrom = null;
+                        event.dataTransfer.effectAllowed = 'move';
+                        event.dataTransfer.setData('text/plain', group);
+                        heading.classList.add('stiae-dragging');
+                        commandList.classList.add('stiae-dragging-command');
+                    });
+                    heading.addEventListener('dragend', () => {
+                        dragGroup = null;
+                        heading.classList.remove('stiae-dragging');
+                        commandList.classList.remove('stiae-dragging-command');
+                    });
+                    heading.append(createElement('span', '', group));
+                    {
+                        heading.append(createElement('span', 'stiae-group-spacer'));
+                        const rename = button('', 'fa-pen', 'stiae-icon-button stiae-group-action');
+                        rename.title = '重新命名這一組';
+                        rename.addEventListener('click', async () => {
+                            const renamed = await showGroupNameForm(group, commandGroupNames(draft.commands));
+                            if (renamed === null || renamed === group) return;
+                            // Renaming onto an existing group merges the two. That reads
+                            // as what you asked for, so it is allowed rather than blocked.
+                            for (const item of draft.commands) {
+                                if ((item.group || '') === group) item.group = renamed;
+                            }
+                            renderCommands();
+                        });
+                        const dissolve = button('', 'fa-xmark', 'stiae-icon-button stiae-group-action');
+                        dissolve.title = '解散這一組';
+                        dissolve.addEventListener('click', async () => {
+                            const members = draft.commands.filter(item => (item.group || '') === group);
+                            const confirmed = await showConfirm(
+                                `解散分組「${group}」嗎？\n\n`
+                                + `裡面的 ${members.length} 個指令會變成沒有分組。指令本身不會被刪掉。`,
+                                { confirmLabel: '解散分組' },
+                            );
+                            if (!confirmed) return;
+                            for (const item of members) item.group = '';
+                            renderCommands();
+                        });
+                        heading.append(rename, dissolve);
+                    }
+                    // ⚠️ Dropping on a heading puts the thing IN FRONT of that group and
+                    // leaves its own grouping alone. Dropping on a command row is what
+                    // files something into a group. Two different landing spots for two
+                    // different intentions — without the first one there is no way to park
+                    // a loose command between two folders, which is exactly what was
+                    // missing when 未分組 was welded into one block.
+                    heading.addEventListener('dragover', event => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        markDropEdge(heading, dropsAfter(event, heading));
+                    });
+                    heading.addEventListener('dragleave', () => clearDropEdge(heading));
+                    heading.addEventListener('drop', event => {
+                        event.preventDefault();
+                        // The box under this heading also accepts drops (as "join this
+                        // group"); without stopping here the same drop would run twice
+                        // and the second one would undo the first.
+                        event.stopPropagation();
+                        const after = dropsAfter(event, heading);
+                        clearDropEdge(heading);
+                        if (dragGroup !== null) dropGroupAt(index, after);
+                        else dropCommandAt(index, null, after);
+                    });
+
+                    groupBox = createElement('div', 'stiae-group-box');
+                    groupBox.append(heading);
+                    // Dropping anywhere in the box — including its empty space — files the
+                    // command into this group, which is what the box looks like it means.
+                    const boxIndex = index;
+                    groupBox.addEventListener('dragover', event => {
+                        if (dragGroup !== null) return;
+                        event.preventDefault();
+                        groupBox.classList.add('stiae-drop-target');
+                    });
+                    groupBox.addEventListener('dragleave', event => {
+                        if (!groupBox.contains(event.relatedTarget)) groupBox.classList.remove('stiae-drop-target');
+                    });
+                    groupBox.addEventListener('drop', event => {
+                        event.preventDefault();
+                        groupBox.classList.remove('stiae-drop-target');
+                        if (dragGroup === null) dropCommandAt(boxIndex, group);
+                    });
+                    commandList.append(groupBox);
                 }
+                // A loose command closes whatever box was open: it belongs on the page,
+                // not inside the group above it.
+                if (!group) groupBox = null;
                 lastGroup = group;
                 const firstOfGroup = index === 0 || (draft.commands[index - 1].group || '') !== group;
                 const lastOfGroup = index === draft.commands.length - 1 || (draft.commands[index + 1].group || '') !== group;
                 const row = createElement('div', 'stiae-command-row');
+                row.draggable = true;
+                row.addEventListener('dragstart', event => {
+                    dragFrom = index;
+                    event.dataTransfer.effectAllowed = 'move';
+                    // Firefox refuses to start a drag without payload.
+                    event.dataTransfer.setData('text/plain', command.id);
+                    row.classList.add('stiae-dragging');
+                    // Reveals the "drop here to leave the group" strip for the duration of
+                    // the drag — see looseZone below for why it has to exist at all.
+                    commandList.classList.add('stiae-dragging-command');
+                });
+                row.addEventListener('dragend', () => {
+                    dragFrom = null;
+                    row.classList.remove('stiae-dragging');
+                    commandList.classList.remove('stiae-dragging-command');
+                });
+                row.addEventListener('dragover', event => {
+                    if (dragGroup === null && dragFrom === null) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.dataTransfer.dropEffect = 'move';
+                    markDropEdge(row, dropsAfter(event, row));
+                });
+                row.addEventListener('dragleave', () => clearDropEdge(row));
+                row.addEventListener('drop', event => {
+                    event.preventDefault();
+                    // See the heading's drop: the enclosing box would otherwise handle
+                    // this a second time.
+                    event.stopPropagation();
+                    const after = dropsAfter(event, row);
+                    clearDropEdge(row);
+                    // A whole group lands beside this row; a single command also adopts
+                    // this row's group, which is what files it into a folder.
+                    if (dragGroup !== null) dropGroupAt(index, after);
+                    else dropCommandAt(index, group, after);
+                });
                 const icon = createElement('i', `fa-solid ${command.icon}`);
                 const name = createElement('div');
                 name.append(createElement('strong', '', command.name));
@@ -3823,12 +4196,15 @@
                 const actions = createElement('div', 'stiae-command-row-actions');
                 const toggle = button('', command.visible ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
                 toggle.title = command.visible ? '從指令列隱藏' : '顯示在指令列';
-                // Movement is within the group. Crossing a boundary here would mean
-                // changing the command's group as a side effect of an arrow press.
-                const up = button('', 'fa-arrow-up', 'stiae-icon-button');
+                // ⚠️ Mobile only (.stiae-move-button is hidden on desktop). Dragging
+                // replaces these where dragging works — but HTML5 drag-and-drop does not
+                // fire on touch, so deleting them outright would leave a phone with no way
+                // to reorder anything at all. Movement stays within the group: crossing a
+                // boundary here would change the command's group as a side effect.
+                const up = button('', 'fa-arrow-up', 'stiae-icon-button stiae-move-button');
                 up.title = grouped ? '在這一組裡上移' : '上移';
                 up.disabled = firstOfGroup;
-                const down = button('', 'fa-arrow-down', 'stiae-icon-button');
+                const down = button('', 'fa-arrow-down', 'stiae-icon-button stiae-move-button');
                 down.title = grouped ? '在這一組裡下移' : '下移';
                 down.disabled = lastOfGroup;
                 const edit = button('', 'fa-pen', 'stiae-icon-button');
@@ -3858,9 +4234,40 @@
                     }
                 });
                 actions.append(toggle, up, down, edit, remove);
-                row.append(icon, name, actions);
-                commandList.append(row);
+                const grip = createElement('span', 'stiae-drag-grip');
+                grip.append(createElement('i', 'fa-solid fa-grip-vertical'));
+                grip.title = '拖曳排序，或拖到別組';
+                row.append(grip, icon, name, actions);
+                (groupBox || commandList).append(row);
             });
+
+            // ⚠️ The one way out of a group by dragging: every other landing spot is
+            // inside something. Once every command sits in a group there is no bare space
+            // left on the page, so without this strip a command could go in and never come
+            // out — the settings form's 不分組 being the only escape, which nobody would
+            // think to look for.
+            //
+            // Its height is fixed and it is always in the layout; only its colours change
+            // while dragging. An earlier version appeared on dragstart and pushed the list
+            // open under the pointer (the dragged row jumped 38px), which made dragging
+            // impossible.
+            if (draft.commands.length) {
+                const looseZone = createElement('div', 'stiae-loose-zone', '移出分組');
+                looseZone.addEventListener('dragover', event => {
+                    if (dragGroup !== null) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    looseZone.classList.add('stiae-drop-target');
+                });
+                looseZone.addEventListener('dragleave', () => looseZone.classList.remove('stiae-drop-target'));
+                looseZone.addEventListener('drop', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    looseZone.classList.remove('stiae-drop-target');
+                    if (dragGroup === null) dropCommandAt(draft.commands.length, '');
+                });
+                commandList.append(looseZone);
+            }
         };
         addCommand.addEventListener('click', async () => {
             const created = await showCommandForm(null, false, commandGroupNames(draft.commands));
@@ -3873,13 +4280,13 @@
         // carries only these commands, and putting it beside the whole-settings backup
         // would make the two look like the same button with a different label.
         const commandBackupRow = createElement('div', 'stiae-inline-fields stiae-button-row');
-        const copyCommands = button('複製指令', 'fa-copy');
-        const pasteCommands = button('貼上指令', 'fa-paste');
+        const copyCommands = button('複製指令代碼', 'fa-copy');
+        const pasteCommands = button('匯入指令代碼', 'fa-paste');
         commandBackupRow.append(copyCommands, pasteCommands);
         const commandBackupHelp = createElement(
             'div',
             'stiae-help',
-            '只含客製指令與它們的分組，不含 Connection Profile、編輯原則與內建指令的修改——那些走下面的「設定備份」。貼上是加進去，現有的指令不會被覆蓋。',
+            '只含客製指令與分組。貼上是加進去，現有的不會被覆蓋。其他設定走下面的「設定備份」。',
         );
 
         copyCommands.addEventListener('click', async () => {
@@ -3890,9 +4297,9 @@
             const text = serializeCommands(draft.commands);
             try {
                 await hostWindow.navigator.clipboard.writeText(text);
-                toast('success', `已複製 ${draft.commands.length} 條客製指令到剪貼簿。`);
+                toast('success', `指令代碼已複製到剪貼簿（含 ${draft.commands.length} 條客製指令）。`);
             } catch {
-                showPayloadExport('複製客製指令', text);
+                showPayloadExport('複製指令代碼', text);
             }
         });
 
@@ -3912,13 +4319,13 @@
 
         const backupHeader = createElement('div', 'stiae-field-label', '設定備份');
         const backupRow = createElement('div', 'stiae-inline-fields stiae-button-row');
-        const copySettings = button('複製設定', 'fa-copy');
-        const pasteSettings = button('貼上設定', 'fa-paste');
+        const copySettings = button('複製設定代碼', 'fa-copy');
+        const pasteSettings = button('匯入設定代碼', 'fa-paste');
         backupRow.append(copySettings, pasteSettings);
         const backupHelp = createElement(
             'div',
             'stiae-help',
-            '每次匯入腳本都會產生新的一份，設定不會自動帶過來。升級前先「複製設定」留一份，匯入新版後貼回來。複製出來的內容只有設定，不含任何聊天內容。',
+            '手動匯入新版時用：舊版按「複製設定代碼」，新版按「匯入設定代碼」。只含設定，不含聊天內容。',
         );
 
         const updateHeader = createElement('div', 'stiae-field-label', '版本與更新');
@@ -3930,17 +4337,17 @@
         const updateHelp = createElement(
             'div',
             'stiae-help',
-            '更新換掉的是腳本庫裡這一支腳本的內容，不會新增第二份——所以你的設定、客製指令與世界書勾選全都留著，不必再複製貼上一次。換完要重新整理頁面才生效。',
+            '換掉的是這一支腳本的內容，不是新增一份，所以設定全都留著。換完會自動重新載入，開著的視窗會關閉。',
         );
         const updateNoAuto = createElement(
             'div',
             'stiae-help',
-            '這個工具不會自己去查有沒有新版。只有你按下「檢查更新」的那一刻它才連外網，其餘時間完全不連。',
+            '只有按下按鈕時才連外網，不會自己去查。',
         );
         const updateRisk = createElement(
             'div',
             'stiae-help',
-            '更新來源固定是這個專案的 GitHub，抓下來的內容會先檢查過才寫入。但這仍等於允許那個 repo 的擁有者在你的瀏覽器裡執行程式碼——不放心就別按更新，改用手動匯入。',
+            '來源固定是本專案的 GitHub，內容會先檢查再寫入。⚠ 但這等於讓那個 repo 在你的瀏覽器裡執行程式碼，不放心就改用手動匯入。',
         );
         const updateLink = createElement('div', 'stiae-help');
         const updateAnchor = createElement('a', '', '在 GitHub 上看變更說明');
@@ -3951,7 +4358,7 @@
         const updateUnsupported = createElement(
             'div',
             'stiae-reference-bad',
-            '你的酒館助手沒有寫入腳本庫的 API（需要 4.8.0 以上），所以只能查有沒有新版，更新要自己手動匯入。',
+            '你的酒館助手需要 4.8.0 以上才能一鍵更新。目前只能查新版，更新請手動匯入。',
         );
 
         const renderUpdate = () => {
@@ -3999,17 +4406,17 @@
             regexBody.append(createElement(
                 'div',
                 'stiae-help',
-                '勾選的規則會在參考樓層送給 AI 之前套用。勾了就跑——不看規則自帶的深度與目的地，也不看它在 SillyTavern 裡是不是停用中。所以你可以建一條只在編輯時用的規則，在正常聊天關掉、只在這裡勾起來。',
+                '勾了就跑：不看深度、目的地，也不看它在 SillyTavern 裡是不是停用。所以可以建一條只給編輯用的規則。',
             ));
             regexBody.append(createElement(
                 'div',
                 'stiae-help',
-                '唯一的例外是「來源」：只寫給 AI 輸出的規則不會套到使用者樓層，反之亦然。這一項規則自己說了算，因為正則看不到一段文字是誰寫的，工具不代它猜。',
+                '唯一的例外是「來源」——寫給 AI 輸出的規則不會套到使用者樓層，反之亦然。',
             ));
             regexBody.append(createElement(
                 'div',
                 'stiae-help',
-                '⚠ 標記代表那條規則自己設了條件、而這裡會忽略它。一整套按深度分工的規則不要整組勾——它們原本互不重疊，條件被拿掉之後會互相把對方的內容刪光。挑做你要的事的那一條就好。',
+                '⚠ 代表那條規則有自己的條件，這裡會忽略。成套按深度分工的規則不要整組勾——條件被拿掉後它們會互相把內容刪光。',
             ));
             if (rules === null) {
                 regexBody.append(createElement('div', 'stiae-reference-bad', '讀不到 SillyTavern 的正則規則。參考資料會以原始文字送出。'));
@@ -4074,6 +4481,7 @@
             builtinList,
             createElement('div', 'stiae-help', '內建指令不能刪除，也不與客製指令混合排序。'),
             commandHeader,
+            createElement('div', 'stiae-help', '拖握把排順序，放在目標的上半或下半決定前後。落在指令上會加入它那一組；落在組名上只換位置。拖組名可整組移動；手機請用箭頭。'),
             commandList,
             addCommand,
             commandBackupRow,
@@ -4129,9 +4537,9 @@
             const text = serializeSettings(collectDraft());
             try {
                 await hostWindow.navigator.clipboard.writeText(text);
-                toast('success', '設定已複製到剪貼簿。');
+                toast('success', '設定代碼已複製到剪貼簿。');
             } catch {
-                showPayloadExport('複製設定', text);
+                showPayloadExport('複製設定代碼', text);
             }
         });
 
