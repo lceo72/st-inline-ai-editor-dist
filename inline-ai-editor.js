@@ -39,7 +39,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.7.2';
+    const VERSION = '0.8.0';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -267,6 +267,13 @@
         return Number.isFinite(number) ? number : fallback;
     }
 
+    // Same trap as finiteOr(): a stored `false` is a real answer and `undefined` is not,
+    // so this cannot collapse to `Boolean(value) || fallback` — that would reopen every
+    // section the user had deliberately folded away, on every save.
+    function normalizeSidebarFlag(value, fallback) {
+        return typeof value === 'boolean' ? value : fallback;
+    }
+
     function normalizeSettings(raw) {
         const settings = raw && typeof raw === 'object' ? raw : {};
         const rect = settings.editorRect && typeof settings.editorRect === 'object' ? settings.editorRect : {};
@@ -308,8 +315,17 @@
             referenceChatId: String(settings.referenceChatId || ''),
             builtinOverrides: normalizeBuiltinOverrides(settings.builtinOverrides),
             commands: Array.isArray(settings.commands) ? sortCommandsByGroup(settings.commands.map(normalizeCommand)) : [],
+            // Which of the sidebar's three sections are expanded. Remembered because the
+            // answer is a working habit, not a per-editor decision: someone who never
+            // touches regex rules should not have to fold that section away every time.
+            // 正則 starts closed — it is the longest list and the one changed least often.
+            sidebarSections: {
+                floors: normalizeSidebarFlag(settings.sidebarSections?.floors, true),
+                worldbook: normalizeSidebarFlag(settings.sidebarSections?.worldbook, true),
+                regex: normalizeSidebarFlag(settings.sidebarSections?.regex, false),
+            },
             editorRect: {
-                width: finiteOr(rect.width, 980),
+                width: finiteOr(rect.width, 1180),
                 height: finiteOr(rect.height, 720),
                 left: finiteOr(rect.left, null),
                 top: finiteOr(rect.top, null),
@@ -1183,6 +1199,11 @@
         activeSettings: null,
         activeConfirm: null,
         activeWorldbook: null,
+        // The two windows the sidebar opens. Both are read-only lookups, and both are on
+        // this list for the same reason as activeWorldbook: Escape has to close the window
+        // being looked at, not the editor holding the draft behind it.
+        activeTextPreview: null,
+        activeRequestPreview: null,
         observer: null,
         destroyed: false,
         cleanup: [],
@@ -1300,7 +1321,11 @@
             /* pre-line so a confirmation can use blank lines to separate "what is about
                to happen" from "what it costs you". Messages without newlines are unchanged. */
             .stiae-confirm-text { padding: 18px 18px 4px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-line; }
-            .stiae-modal { position: fixed; display: flex; flex-direction: column; min-width: 520px; min-height: 420px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow: hidden; resize: both; background: var(--stiae-bg); color: var(--stiae-fg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); }
+            /* ⚠️ min-width is wrapped in min() for a reason: the editor now carries a
+               320px sidebar beside the text, so the floor below which it stops being
+               usable went up — but a flat 780px would push the window wider than a
+               narrow desktop viewport, since max-width cannot win against min-width. */
+            .stiae-modal { position: fixed; display: flex; flex-direction: column; min-width: min(780px, calc(100vw - 24px)); min-height: 420px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow: hidden; resize: both; background: var(--stiae-bg); color: var(--stiae-fg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); }
             .stiae-review-modal { position: relative; width: min(1180px, calc(100vw - 36px)); height: min(820px, calc(100vh - 36px)); resize: both; }
             .stiae-settings-modal { position: relative; width: min(900px, calc(100vw - 36px)); max-height: min(850px, calc(100vh - 36px)); background: var(--stiae-bg); border: 1px solid var(--stiae-border); border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.55); display: flex; flex-direction: column; overflow: hidden; }
             .stiae-header { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--stiae-border); cursor: move; user-select: none; }
@@ -1339,29 +1364,53 @@
             .stiae-mobile-menu-item { display: none !important; }
             .stiae-scope { flex: 0 0 auto; padding: 7px 13px; color: var(--stiae-muted); border-bottom: 1px solid var(--stiae-border); font-size: .9em; }
             .stiae-scope.is-selection { color: var(--SmartThemeEmColor, #f1d37a); }
-            .stiae-reference { flex: 0 0 auto; border-bottom: 1px solid var(--stiae-border); }
-            .stiae-reference[open] { max-height: 46vh; overflow-y: auto; }
-            .stiae-reference-summary { cursor: pointer; padding: 7px 13px; color: var(--stiae-muted); font-size: .9em; overflow-wrap: anywhere; }
-            .stiae-reference-summary::-webkit-details-marker { display: none; }
-            .stiae-reference-body { padding: 0 13px 11px; display: flex; flex-direction: column; gap: 7px; }
+            /* The text and the settings that describe it sit side by side from 0.8.0.
+               Before that everything was one column, and expanding the reference section
+               ate up to 46vh of the textarea — the reason this layout exists. */
+            .stiae-main { flex: 1 1 auto; min-height: 0; display: flex; align-items: stretch; }
+            .stiae-workspace { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+            .stiae-side { flex: 0 0 320px; min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--stiae-border); }
+            /* ⚠️ The one and only scrolling region in the sidebar. Nothing inside the
+               three sections may carry its own max-height + overflow: two scrollers
+               nested like that fight over the same wheel gesture, which is exactly what
+               moving the world info picker into its own window fixed in 0.7.0. A long
+               list simply makes this column longer. */
+            .stiae-side-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+            .stiae-side-foot { flex: 0 0 auto; padding: 9px 11px; border-top: 1px solid var(--stiae-border); }
+            .stiae-side-foot .stiae-button { width: 100%; }
+            .stiae-side-section { border-bottom: 1px solid var(--stiae-border); }
+            .stiae-side-summary { display: flex; align-items: baseline; gap: 6px; cursor: pointer; padding: 9px 11px; font-size: .92em; font-weight: 700; list-style: none; }
+            .stiae-side-summary::-webkit-details-marker { display: none; }
+            /* A caret drawn by us, because a summary set to display:flex loses the
+               browser's own marker in Chrome — and a section that cannot be seen to be
+               foldable will not get folded. */
+            .stiae-side-summary::before { content: '▸'; flex: 0 0 auto; color: var(--stiae-muted); font-weight: 400; }
+            details[open] > .stiae-side-summary::before { content: '▾'; }
+            .stiae-side-count { margin-left: auto; color: var(--stiae-muted); font-size: .82em; font-weight: 400; text-align: right; overflow-wrap: anywhere; }
+            .stiae-side-body { display: flex; flex-direction: column; gap: 7px; padding: 0 11px 11px; }
+            /* A row is a lookup: press it and the whole floor or entry opens in a window
+               of its own. The ✕ on a world info row is a second button beside it rather
+               than inside it — a button within a button is not valid, and clicking to
+               remove would also trigger the lookup. */
+            .stiae-side-row { display: flex; align-items: stretch; border: 1px solid var(--stiae-border); border-radius: 6px; background: rgba(0,0,0,.14); }
+            .stiae-side-row:hover { border-color: var(--stiae-accent); }
+            .stiae-side-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px 7px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+            .stiae-side-row-x { flex: 0 0 auto; padding: 0 8px; border: 0; background: transparent; color: var(--stiae-muted); cursor: pointer; font: inherit; }
+            .stiae-side-row-x:hover { color: #ff9b9b; }
+            .stiae-side-row-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+            .stiae-side-row-id { flex: 0 0 auto; font-weight: 700; color: var(--stiae-accent); }
+            .stiae-side-row-meta { color: var(--stiae-muted); font-size: .82em; overflow-wrap: anywhere; }
+            /* Two lines of the text itself, then it stops. One line was not enough to
+               recognise a scene by; unbounded turns the sidebar into the transcript. */
+            .stiae-side-row-snippet { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: .85em; line-height: 1.45; opacity: .9; overflow-wrap: anywhere; }
+            .stiae-side-row-dim { opacity: .55; }
+            .stiae-side-static { padding: 6px 7px; border: 1px dashed var(--stiae-border); border-radius: 6px; }
             .stiae-reference-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
             .stiae-reference-input { flex: 1 1 190px; min-width: 0; box-sizing: border-box; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 5px; background: rgba(0,0,0,.18); color: var(--stiae-fg); font-family: inherit; font-size: 1em; }
             .stiae-reference-notes { display: flex; flex-direction: column; gap: 4px; }
             .stiae-reference-bad { color: #ffb0b0; font-size: .88em; }
-            .stiae-reference-list { display: flex; flex-direction: column; gap: 3px; font-size: .88em; }
-            /* Three ranks in one line, and they have to read as three: the floor number is
-               the anchor you scan for, the role and name are a label, the text is the
-               content. Before 0.7.0 the number and the label both landed on the theme
-               accent and the row came out as one loud stripe. */
-            .stiae-ref-row { display: flex; gap: 8px; align-items: baseline; padding: 3px 6px; border-radius: 5px; background: rgba(0,0,0,.14); }
-            .stiae-ref-id { flex: 0 0 auto; font-weight: 700; color: var(--stiae-accent); }
-            .stiae-ref-meta { flex: 0 0 auto; color: var(--stiae-muted); font-size: .88em; }
+            .stiae-reference-list { display: flex; flex-direction: column; gap: 5px; }
             .stiae-ref-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .92; }
-            .stiae-ref-excluded { opacity: .6; }
-            /* The row the editor keeps: the cost of this request stays visible without
-               opening anything, which is the whole reason the summary exists. */
-            .stiae-wb-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 9px; border: 1px solid var(--stiae-border); border-radius: 6px; }
-            .stiae-wb-summary { flex: 1 1 190px; min-width: 0; color: var(--stiae-muted); font-size: .9em; overflow-wrap: anywhere; }
             .stiae-wb-modal { width: min(760px, calc(100vw - 36px)); height: min(760px, calc(100vh - 36px)); max-height: min(760px, calc(100vh - 36px)); resize: both; }
             /* Only the entry list scrolls. The search box and the book dropdown stay put
                while you work through a book — that pinning is the point of the dialog, and
@@ -1381,17 +1430,29 @@
             .stiae-wb-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px; border: 1px solid var(--stiae-border); border-radius: 6px; cursor: pointer; font-size: .88em; }
             .stiae-wb-row input { width: auto; margin-top: 3px; }
             .stiae-wb-row > div { flex: 1 1 auto; min-width: 0; }
-            .stiae-reference-full > summary { cursor: pointer; color: var(--stiae-muted); font-size: .88em; }
-            .stiae-reference-pre { max-height: 240px; overflow: auto; margin: 6px 0 0; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            /* The two read-only windows the sidebar opens: one floor / one world info
+               entry, and the whole request. Both are built on .stiae-settings-modal so the
+               phone rule that takes dialogs full screen already covers them. */
+            .stiae-text-modal { width: min(720px, calc(100vw - 36px)); height: min(700px, calc(100vh - 36px)); max-height: min(700px, calc(100vh - 36px)); resize: both; }
+            .stiae-text-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+            .stiae-text-tabs { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+            .stiae-tab-on { border-color: var(--SmartThemeQuoteColor, #7aa2d8) !important; }
+            .stiae-text-pre { flex: 1 1 auto; min-height: 0; overflow: auto; margin: 0; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            .stiae-preview-modal { width: min(900px, calc(100vw - 36px)); height: min(820px, calc(100vh - 36px)); max-height: min(820px, calc(100vh - 36px)); resize: both; }
+            /* One scroller again: the message bodies below grow, the dialog scrolls. */
+            .stiae-preview-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+            .stiae-preview-pick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+            .stiae-preview-rows { display: flex; flex-direction: column; gap: 8px; }
+            .stiae-preview-pre { margin: 0; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
             .stiae-request-preview { margin-bottom: 9px; border: 1px solid var(--stiae-border); border-radius: 7px; padding: 8px; }
             .stiae-request-preview > summary { cursor: pointer; color: var(--stiae-muted); }
             .stiae-request-role { margin: 8px 0 3px; font-weight: 700; font-size: .88em; color: var(--stiae-muted); }
             .stiae-request-body { max-height: 300px; overflow: auto; margin: 0; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0,0,0,.22); border: 1px solid var(--stiae-border); border-radius: 6px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-            .stiae-regex-section { margin-bottom: 13px; }
-            .stiae-regex-section > summary { cursor: pointer; }
-            .stiae-regex-body { display: flex; flex-direction: column; gap: 7px; padding-top: 7px; }
-            .stiae-regex-list { display: flex; flex-direction: column; gap: 5px; max-height: 320px; overflow-y: auto; }
-            .stiae-regex-row { display: flex; align-items: flex-start; gap: 8px; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 6px; cursor: pointer; }
+            /* ⚠️ No max-height and no scroller. In the settings dialog this list had one;
+               in the sidebar a second scroller would compete with .stiae-side-scroll for
+               the same wheel gesture. */
+            .stiae-regex-list { display: flex; flex-direction: column; gap: 5px; }
+            .stiae-regex-row { display: flex; align-items: flex-start; gap: 8px; padding: 7px; border: 1px solid var(--stiae-border); border-radius: 6px; cursor: pointer; font-size: .88em; }
             .stiae-regex-row input { width: auto; margin-top: 3px; }
             .stiae-regex-override { margin-top: 3px; color: #ffc98a; font-size: .84em; line-height: 1.45; }
             .stiae-editor-body { flex: 1 1 auto; min-height: 0; padding: 12px; display: flex; }
@@ -1517,9 +1578,13 @@
                 .stiae-inline-fields { grid-template-columns: 1fr; }
                 .stiae-button span { display: inline; }
                 .stiae-toolbar { flex-wrap: nowrap; }
-                .stiae-reference[open] { max-height: 52vh; }
+                /* The phone keeps the 0.7.2 shape: one column, the settings stacked above
+                   the text and folded away by default (openEditor sets that), bounded by
+                   the same 52vh the reference section used to have. A 320px column beside
+                   a 375px screen would leave nothing to edit in. */
+                .stiae-main { flex-direction: column; }
+                .stiae-side { order: -1; flex: 0 0 auto; max-height: 52vh; border-left: 0; border-bottom: 1px solid var(--stiae-border); }
                 .stiae-reference-input { flex: 1 1 100%; }
-                .stiae-ref-row { flex-wrap: wrap; }
                 .stiae-ref-text { flex: 1 1 100%; white-space: normal; }
             }
         `;
@@ -1755,7 +1820,8 @@
             // ⚠️ `message` only. The host attaches the whole `swipes` array by default,
             // and pulling that in would multiply a single floor several times over.
             const role = String(message.role || '');
-            const applied = applyTavernRegexes(String(message.message ?? ''), selected, role);
+            const raw = String(message.message ?? '');
+            const applied = applyTavernRegexes(raw, selected, role);
             for (const name of applied.failed) failedRules.add(name);
             return {
                 id: Number(message.message_id),
@@ -1763,6 +1829,11 @@
                 role,
                 isHidden: Boolean(message.is_hidden),
                 text: applied.text,
+                // ⚠️ Kept here rather than re-read when the preview window opens. Reading
+                // the floor again would show what it says *now*, which can differ from
+                // what this reference material was built from — and the window would be
+                // claiming to show the original of something it is not the original of.
+                raw,
                 appliedRules: applied.applied,
             };
         });
@@ -1774,7 +1845,10 @@
         const worldbookEntries = picked.entries.map(entry => {
             const applied = applyTavernRegexes(entry.content, selected, 'world_info');
             for (const name of applied.failed) failedRules.add(name);
-            return { ...entry, content: applied.text, appliedRules: applied.applied };
+            // `raw` for the same reason as a floor's: the preview window has to be able to
+            // show what the entry said before the rules ran, without going back to a
+            // catalogue that may have been reloaded since.
+            return { ...entry, content: applied.text, raw: entry.content, appliedRules: applied.applied };
         });
 
         const present = new Set(entries.map(entry => entry.id));
@@ -1867,7 +1941,11 @@
 
     function placeEditorModal(modal) {
         const saved = state.settings.editorRect;
-        const width = Math.min(saved.width || 980, hostWindow.innerWidth - 24);
+        // ⚠️ The floor is not cosmetic. A window saved by 0.7.x was sized for text alone;
+        // reopening it in 0.8.0 puts a 320px sidebar inside the same width, and a 620px
+        // window would leave a column of text too narrow to work in. Widened once on
+        // open, then whatever the user drags it to is what gets remembered.
+        const width = Math.min(Math.max(saved.width || 1180, 820), hostWindow.innerWidth - 24);
         const height = Math.min(saved.height || 720, hostWindow.innerHeight - 24);
         const left = saved.left == null ? (hostWindow.innerWidth - width) / 2 : Math.max(12, Math.min(saved.left, hostWindow.innerWidth - width - 12));
         const top = saved.top == null ? (hostWindow.innerHeight - height) / 2 : Math.max(12, Math.min(saved.top, hostWindow.innerHeight - height - 12));
@@ -1927,7 +2005,9 @@
     // hundreds of rows inside the SillyTavern tab. The floors themselves are not
     // capped — only how many of them get drawn.
     const REFERENCE_LIST_LIMIT = 20;
-    const REFERENCE_SNIPPET_LENGTH = 40;
+    // Two clamped lines' worth. It was 40 while a row was a single ellipsised line in the
+    // editor; a sidebar row has the height for enough text to recognise a scene by.
+    const REFERENCE_SNIPPET_LENGTH = 90;
     const REFERENCE_DEBOUNCE_MS = 250;
 
     function referenceSnippet(text) {
@@ -1941,23 +2021,29 @@
         return role || '未知';
     }
 
-    // The collapsed line states the range and the size outright. The whole point of
-    // this row is that the cost of a request is visible before the button is pressed,
-    // so "參考資料" on its own would not do the job.
+    // Each section header states its own cost outright. In 0.7.2 one collapsed line did
+    // this for all of it; the sidebar splits the setting into three, so the count splits
+    // with it — a single total on one of the three headers would belong to none of them.
+    //
+    // The point is unchanged: what this request costs is readable without expanding
+    // anything.
     function updateReferenceSummary(session) {
+        if (!session.floorsCount) return;
         // Counts what actually goes out, not what was typed: a floor emptied by a regex
         // rule would otherwise be advertised as attached when nothing of it is sent.
         const sent = session.reference?.sent || [];
-        const books = session.reference?.worldbook?.sent || [];
-        if (!sent.length && !books.length) {
-            session.referenceSummary.textContent = '📎 參考資料：未指定';
+        if (!sent.length) {
+            session.floorsCount.textContent = '未指定';
             return;
         }
-        const parts = [];
-        if (sent.length) parts.push(`第 ${formatFloorRanges(sent.map(entry => entry.id))} 樓`);
-        if (books.length) parts.push(`世界書 ${books.length} 條`);
-        parts.push(`${session.reference.block.length.toLocaleString('en-US')} 字元`);
-        session.referenceSummary.textContent = `📎 參考資料：${parts.join(' · ')}`;
+        const size = sent.reduce((total, entry) => total + entry.text.length, 0);
+        session.floorsCount.textContent = `${sent.length} 樓 · ${size.toLocaleString('en-US')} 字元`;
+    }
+
+    function updateRegexSummary(session) {
+        if (!session.regexCount) return;
+        const count = state.settings.regexRuleIds.length;
+        session.regexCount.textContent = count ? `已勾選 ${count} 條` : '未勾選';
     }
 
     // Counts what actually goes out, for the same reason the outer line does: an entry a
@@ -1969,11 +2055,11 @@
     // plain sight. Wording them alike made that read as a bug; the counts themselves are
     // both correct and neither may be changed to match the other.
     function updateWorldbookSummary(session) {
-        if (!session.worldbookSummary) return;
+        if (!session.worldbookCount) return;
         const books = session.reference?.worldbook?.sent || [];
-        session.worldbookSummary.textContent = books.length
-            ? `📚 世界書：已附加 ${books.length} 條 · ${books.reduce((total, entry) => total + entry.content.length, 0).toLocaleString('en-US')} 字元`
-            : '📚 世界書：未附加任何條目';
+        session.worldbookCount.textContent = books.length
+            ? `已附加 ${books.length} 條 · ${books.reduce((total, entry) => total + entry.content.length, 0).toLocaleString('en-US')} 字元`
+            : '未附加';
     }
 
     function renderReferenceDetail(session) {
@@ -2009,7 +2095,7 @@
             note('stiae-reference-bad', `第 ${formatFloorRanges(reference.emptied)} 樓套用正則後整段變成空的，不會送出。`);
         }
         if (reference?.entries.length && state.settings.regexRuleIds.length && !reference.rulesUnavailable) {
-            note('stiae-help', `已套用 ${state.settings.regexRuleIds.length} 條正則規則（在設定裡挑選）。`);
+            note('stiae-help', `已套用 ${state.settings.regexRuleIds.length} 條正則規則（在下面的「正則規則」挑選）。`);
         }
 
         // Every floor the input resolved to shows up here, including the one that was
@@ -2020,25 +2106,34 @@
         rows.sort((a, b) => a.id - b.id);
 
         for (const row of rows.slice(0, REFERENCE_LIST_LIMIT)) {
-            const line = createElement('div', 'stiae-ref-row');
-            line.append(createElement('strong', 'stiae-ref-id', `#${row.id}`));
             if (row.excluded) {
-                line.classList.add('stiae-ref-excluded');
-                line.append(createElement('span', 'stiae-ref-meta', '已排除（這是你正在編輯的樓層）'));
-            } else {
-                const marks = [roleLabelOf(row.role)];
-                if (row.isHidden) marks.push('已隱藏');
-                // Rules only run on the floors they were written for, so "why didn't
-                // this one change" has to be answerable per floor, not just per rule.
-                if (state.settings.regexRuleIds.length) marks.push(`正則 ${row.appliedRules ?? 0} 條`);
-                if (!row.text.length) {
-                    marks.push('正則後為空');
-                    line.classList.add('stiae-ref-excluded');
-                }
-                line.append(createElement('span', 'stiae-ref-meta', `${row.name || '未知'} · ${marks.join(' · ')}`));
-                line.append(createElement('span', 'stiae-ref-text', referenceSnippet(row.text)));
+                const line = createElement('div', 'stiae-side-static stiae-side-row-dim');
+                const head = createElement('div', 'stiae-side-row-head');
+                head.append(createElement('strong', 'stiae-side-row-id', `#${row.id}`));
+                head.append(createElement('span', 'stiae-side-row-meta', '已排除（這是你正在編輯的樓層）'));
+                line.append(head);
+                list.append(line);
+                continue;
             }
-            list.append(line);
+            const marks = [row.name || '未知', roleLabelOf(row.role)];
+            if (row.isHidden) marks.push('已隱藏');
+            // Rules only run on the floors they were written for, so "why didn't
+            // this one change" has to be answerable per floor, not just per rule.
+            if (state.settings.regexRuleIds.length) marks.push(`正則 ${row.appliedRules ?? 0} 條`);
+            if (!row.text.length) marks.push('正則後為空');
+            list.append(sideRow({
+                id: `#${row.id}`,
+                meta: marks.join(' · '),
+                snippet: referenceSnippet(row.text),
+                dim: !row.text.length,
+                openTitle: '看這一樓的完整內文',
+                onOpen: () => openTextPreview({
+                    title: `第 ${row.id} 樓 · ${roleLabelOf(row.role)}`,
+                    subtitle: row.name || '',
+                    sent: row.text,
+                    raw: row.raw,
+                }),
+            }));
         }
         if (rows.length > REFERENCE_LIST_LIMIT) {
             list.append(createElement('div', 'stiae-help', `…另外還有 ${rows.length - REFERENCE_LIST_LIMIT} 樓，沒有列出來，但一樣會送出。`));
@@ -2046,8 +2141,121 @@
         if (!rows.length && !notes.childElementCount) {
             list.append(createElement('div', 'stiae-help', '還沒指定任何樓層。'));
         }
+    }
 
-        session.referenceFullText.textContent = reference?.block || '（這次沒有參考資料）';
+    // One row in the sidebar: press it and the thing it names opens in full. The ✕, when
+    // there is one, is a sibling of that button rather than a child — a button inside a
+    // button is invalid, and nesting would make removing an entry also open it.
+    function sideRow({ id, meta, snippet, dim = false, openTitle = '', onOpen, onRemove = null }) {
+        const wrapper = createElement('div', `stiae-side-row${dim ? ' stiae-side-row-dim' : ''}`);
+        const main = createElement('button', 'stiae-side-row-main');
+        main.type = 'button';
+        if (openTitle) main.title = openTitle;
+        const head = createElement('div', 'stiae-side-row-head');
+        if (id) head.append(createElement('strong', 'stiae-side-row-id', id));
+        head.append(createElement('span', 'stiae-side-row-meta', meta));
+        main.append(head, createElement('div', 'stiae-side-row-snippet', snippet || '（空的）'));
+        main.addEventListener('click', onOpen);
+        wrapper.append(main);
+        if (onRemove) {
+            const drop = createElement('button', 'stiae-side-row-x', '✕');
+            drop.type = 'button';
+            drop.title = '取消這一條';
+            drop.addEventListener('click', onRemove);
+            wrapper.append(drop);
+        }
+        return wrapper;
+    }
+
+    // A read-only lookup: one floor, or one world info entry, in full — so that "which
+    // scene was #42 again" is answerable without closing the editor and losing the draft.
+    //
+    // Shows what will actually be sent. When a regex rule changed the text there is a
+    // second tab for the untouched original: the sent version is the honest default, and
+    // the original is what makes a rule that ate half a floor visible instead of puzzling.
+    //
+    // ⚠️ Claims Escape through state.activeTextPreview. Without that flag
+    // onDocumentKeydown would close the editor — and the draft with it — from under the
+    // window being read. Same reason as the world info picker.
+    function openTextPreview({ title, subtitle = '', sent, raw }) {
+        if (state.activeTextPreview) return;
+        const outgoing = String(sent ?? '');
+        const original = String(raw ?? outgoing);
+        const changed = original !== outgoing;
+
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
+        const modal = createElement('section', 'stiae-settings-modal stiae-text-modal');
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        const header = createElement('header', 'stiae-header');
+        header.append(createElement('strong', '', subtitle ? `${title} · ${subtitle}` : title));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        close.title = '關閉';
+        header.append(close);
+
+        const body = createElement('div', 'stiae-text-body');
+        const tabs = createElement('div', 'stiae-text-tabs');
+        const pre = createElement('pre', 'stiae-text-pre');
+        const sentTab = button('會送出的內容', 'fa-paper-plane', 'stiae-tab-on');
+        const rawTab = button('原始內容', 'fa-file-lines');
+        const size = createElement('div', 'stiae-help');
+
+        const show = which => {
+            const text = which === 'raw' ? original : outgoing;
+            pre.textContent = text || '（空的）';
+            sentTab.classList.toggle('stiae-tab-on', which !== 'raw');
+            rawTab.classList.toggle('stiae-tab-on', which === 'raw');
+            size.textContent = which === 'raw'
+                ? `這是套用正則規則之前的原文 · ${original.length.toLocaleString('en-US')} 字元`
+                : `這就是會附給 AI 的文字 · ${outgoing.length.toLocaleString('en-US')} 字元`;
+        };
+        if (changed) {
+            tabs.append(sentTab, rawTab);
+            body.append(tabs);
+        }
+        body.append(size, pre);
+        show('sent');
+
+        const footer = createElement('footer', 'stiae-footer');
+        const copy = button('複製', 'fa-copy');
+        const done = button('關閉', 'fa-check', 'stiae-primary');
+        footer.append(copy, done);
+
+        modal.append(header, body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+        state.activeTextPreview = overlay;
+
+        const dismiss = () => {
+            if (state.activeTextPreview !== overlay) return;
+            state.activeTextPreview = null;
+            hostDocument.removeEventListener('keydown', onKey, true);
+            overlay.remove();
+        };
+        function onKey(event) {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            event.stopPropagation();
+            dismiss();
+        }
+
+        sentTab.addEventListener('click', () => show('sent'));
+        rawTab.addEventListener('click', () => show('raw'));
+        copy.addEventListener('click', async () => {
+            try {
+                await hostWindow.navigator.clipboard.writeText(pre.textContent);
+                toast('success', '已複製到剪貼簿。');
+            } catch {
+                toast('error', '瀏覽器不允許複製，請自己選取。');
+            }
+        });
+        close.addEventListener('click', dismiss);
+        done.addEventListener('click', dismiss);
+        overlay.addEventListener('mousedown', event => {
+            if (event.target === overlay) dismiss();
+        });
+        hostDocument.addEventListener('keydown', onKey, true);
     }
 
     async function refreshReference(session) {
@@ -2058,12 +2266,14 @@
         session.reference = reference;
         updateReferenceSummary(session);
         updateWorldbookSummary(session);
+        updateRegexSummary(session);
         renderReferenceDetail(session);
         // Only the parts whose text depends on what actually went out. Redrawing the
         // whole picker here would throw away the user's scroll position and open groups
         // every time a box is ticked.
         renderWorldbookNotes(session);
         renderWorldbookSelected(session);
+        renderWorldbookSidebar(session);
         return reference;
     }
 
@@ -2075,16 +2285,18 @@
         }, REFERENCE_DEBOUNCE_MS);
     }
 
-    // Ticking five entries in a row used to run buildReference five times, and each run
-    // re-reads the regex rules and re-applies them to every book entry.
+    // Shared by the two things that are ticked rather than typed: world info entries and,
+    // from 0.8.0, regex rules. Ticking five entries in a row used to run buildReference
+    // five times, and each run re-reads the regex rules and re-applies them to every
+    // floor and every book entry.
     //
     // ⚠️ Deliberately NOT scheduleReferenceRefresh: that one also persists the reference
-    // floor input, which has nothing to do with world info. And only the recomputation is
-    // delayed — the tick itself, the chips, and persisting the selection all stay
-    // immediate, or the box would look like it did not register the click.
-    function scheduleWorldbookRefresh(session) {
-        hostWindow.clearTimeout(session.worldbookRefreshTimer);
-        session.worldbookRefreshTimer = hostWindow.setTimeout(() => {
+    // floor input, which has nothing to do with either of these. And only the
+    // recomputation is delayed — the tick itself, the row, and persisting the selection
+    // all stay immediate, or the box would look like it did not register the click.
+    function scheduleContextRefresh(session) {
+        hostWindow.clearTimeout(session.contextRefreshTimer);
+        session.contextRefreshTimer = hostWindow.setTimeout(() => {
             refreshReference(session);
         }, REFERENCE_DEBOUNCE_MS);
     }
@@ -2113,7 +2325,11 @@
             else session.worldbookSelection.delete(entry.key);
             persistWorldbookSelection(session);
             renderWorldbookSelected(session);
-            scheduleWorldbookRefresh(session);
+            // The sidebar list is what the editor shows once this window closes, so it
+            // follows the tick immediately. Only the recomputed counts wait for the
+            // debounce — see scheduleContextRefresh.
+            renderWorldbookSidebar(session);
+            scheduleContextRefresh(session);
         });
         label.append(box, text);
         return label;
@@ -2122,8 +2338,16 @@
     // Notes are rebuilt after every refresh, which is why "emptied by a regex rule" lives
     // here and not on the row: a row is only redrawn when the list is, and a stale mark
     // saying an entry was dropped when it no longer is would be a lie nobody could catch.
+    //
+    // Two places want them from 0.8.0: the sidebar section, which is always there, and the
+    // picker window, which only exists while it is open. Both get the same text from one
+    // pass — a second copy of these rules would be a second chance to drift.
     function renderWorldbookNotes(session) {
-        const notes = session.worldbookNotes;
+        renderWorldbookNotesInto(session, session.worldbookSideNotes);
+        renderWorldbookNotesInto(session, session.worldbookNotes);
+    }
+
+    function renderWorldbookNotesInto(session, notes) {
         if (!notes) return;
         notes.replaceChildren();
         const note = (kind, text) => notes.append(createElement('div', kind === 'help' ? 'stiae-help' : 'stiae-reference-bad', text));
@@ -2175,7 +2399,8 @@
                 session.worldbookSelection.delete(entry.key);
                 persistWorldbookSelection(session);
                 renderWorldbookList(session);
-                scheduleWorldbookRefresh(session);
+                renderWorldbookSidebar(session);
+                scheduleContextRefresh(session);
             });
             chip.append(drop);
             chips.append(chip);
@@ -2186,7 +2411,8 @@
             session.worldbookSelection.clear();
             persistWorldbookSelection(session);
             renderWorldbookList(session);
-            scheduleWorldbookRefresh(session);
+            renderWorldbookSidebar(session);
+            scheduleContextRefresh(session);
         });
         box.append(clear);
     }
@@ -2346,22 +2572,60 @@
         await refreshReference(session);
     }
 
-    // All the editor keeps is this line: what this request will actually cost, plus the
-    // button that opens the picker. Everything else moved into a window of its own.
+    // The sidebar's own list of what is ticked. 0.7.0 moved the picker into a window of
+    // its own, which fixed the cramped nested scrollers but left the editor knowing only
+    // a count — "已附加 5 條" cannot tell you *which* five, so checking meant reopening
+    // the window every time. Picking still happens in that window; seeing does not.
     //
-    // Inside the editor the picker was a scroller nested in a scroller, sharing what was
-    // left of a window that also has to hold the text being edited — the entries came out
-    // cramped and ran into each other. The summary stays behind because its whole purpose
-    // is being readable *without* opening anything.
-    function buildWorldbookLine(session) {
-        const line = createElement('div', 'stiae-wb-line');
-        const summary = createElement('div', 'stiae-wb-summary');
-        const open = button('選條目', 'fa-book-open');
-        open.addEventListener('click', () => openWorldbookDialog(session));
-        line.append(summary, open);
-        session.worldbookSummary = summary;
-        updateWorldbookSummary(session);
-        return line;
+    // Every row opens the entry in full, and carries a ✕ so a pick can be dropped without
+    // going back into the picker at all.
+    function renderWorldbookSidebar(session) {
+        const list = session.worldbookList;
+        if (!list) return;
+        list.replaceChildren();
+        // ⚠️ Keyed off what is ticked, NOT off what is loaded and drawable below. The
+        // difference is the case that needs this button most: after a character card is
+        // swapped out, its picks are kept but their books are gone, so nothing renders —
+        // and clearing them one ✕ at a time is impossible because there are no rows.
+        session.worldbookClear?.classList.toggle('stiae-hidden', !session.worldbookSelection.size);
+        if (!worldbookApiAvailable()) return;
+        const chosen = allLoadedWorldbookEntries(session).filter(entry => session.worldbookSelection.has(entry.key));
+        if (!chosen.length) {
+            if (!session.worldbookSelection.size) list.append(createElement('div', 'stiae-help', '還沒勾選任何條目。'));
+            return;
+        }
+        // ⚠️ Both halves of the last refresh, not just `sent`. An entry a regex rule
+        // emptied lives in `emptied`, and falling back to the catalogue for it would draw
+        // the untouched text under a row marked 正則後為空 — the row would contradict
+        // itself. Missing from both means the refresh has not landed yet, and then the
+        // catalogue text is the honest thing to show.
+        const processed = new Map([
+            ...(session.reference?.worldbook?.sent || []),
+            ...(session.reference?.worldbook?.emptied || []),
+        ].map(entry => [entry.key, entry]));
+        for (const entry of chosen) {
+            const applied = processed.get(entry.key);
+            const emptied = Boolean(applied) && !applied.content.length;
+            list.append(sideRow({
+                meta: `${entry.book} › ${entry.name || '（未命名條目）'}${emptied ? ' · 正則後為空' : ''}`,
+                snippet: referenceSnippet(applied ? applied.content : entry.content),
+                dim: emptied,
+                openTitle: '看這一條的完整內容',
+                onOpen: () => openTextPreview({
+                    title: entry.name || '（未命名條目）',
+                    subtitle: entry.book,
+                    sent: applied ? applied.content : entry.content,
+                    raw: applied ? applied.raw : entry.content,
+                }),
+                onRemove: () => {
+                    session.worldbookSelection.delete(entry.key);
+                    persistWorldbookSelection(session);
+                    renderWorldbookList(session);
+                    renderWorldbookSidebar(session);
+                    scheduleContextRefresh(session);
+                },
+            }));
+        }
     }
 
     // The picks are saved as they are ticked, so this window has nothing to confirm and
@@ -2478,10 +2742,33 @@
         search.focus();
     }
 
-    function buildReferenceSection(session) {
-        const details = createElement('details', 'stiae-reference');
-        const summary = createElement('summary', 'stiae-reference-summary');
-        const body = createElement('div', 'stiae-reference-body');
+    // One collapsible block of the sidebar. The open/closed state is remembered per
+    // section (see normalizeSettings) because it is a working habit rather than a
+    // per-editor decision.
+    //
+    // ⚠️ On a phone every section starts closed regardless of what was remembered: the
+    // sidebar stacks above the text there, and three open sections would leave nothing
+    // to edit in. Only opening one is ever written back, and that matches the desktop
+    // default anyway.
+    function buildSideSection(session, key, title) {
+        const details = createElement('details', 'stiae-side-section');
+        details.open = state.settings.sidebarSections[key] && hostWindow.innerWidth > 760;
+        const summary = createElement('summary', 'stiae-side-summary');
+        summary.append(createElement('span', '', title));
+        const count = createElement('span', 'stiae-side-count');
+        summary.append(count);
+        const body = createElement('div', 'stiae-side-body');
+        details.append(summary, body);
+        details.addEventListener('toggle', () => {
+            state.settings.sidebarSections[key] = details.open;
+            saveSettings();
+        });
+        return { details, count, body };
+    }
+
+    function buildFloorsSection(session) {
+        const section = buildSideSection(session, 'floors', '參考樓層');
+        session.floorsCount = section.count;
 
         const row = createElement('div', 'stiae-reference-row');
         const input = createElement('input', 'stiae-reference-input');
@@ -2496,22 +2783,17 @@
         const help = createElement(
             'div',
             'stiae-help',
-            '唯讀，不會寫回聊天。換聊天就清空。',
+            '唯讀，不會寫回聊天。換聊天就清空。點一列可以看那一樓的完整內文。',
         );
         const notes = createElement('div', 'stiae-reference-notes');
         const list = createElement('div', 'stiae-reference-list');
-        const full = createElement('details', 'stiae-reference-full');
-        full.append(createElement('summary', '', '查看送出的完整參考資料'));
-        const fullText = createElement('pre', 'stiae-reference-pre');
-        full.append(fullText);
 
-        body.append(row, help, notes, list, buildWorldbookLine(session), full);
-        details.append(summary, body);
-
-        session.referenceSummary = summary;
+        section.body.append(row, help, notes, list);
         session.referenceNotes = notes;
         session.referenceList = list;
-        session.referenceFullText = fullText;
+        // Says 未指定 straight away rather than sitting blank until the first refresh
+        // lands. Same reason the other two sections fill their counts as they are built.
+        updateReferenceSummary(session);
 
         // The quick buttons only type for you — the text box stays the single source
         // of truth. That is what keeps "前 5 樓" from being ambiguous: the answer is
@@ -2527,7 +2809,7 @@
             input.value = from === to ? String(from) : `${from}-${to}`;
             session.referenceInput = input.value;
             persistReferenceInput(session);
-            details.open = true;
+            section.details.open = true;
             refreshReference(session);
         };
 
@@ -2546,7 +2828,273 @@
             refreshReference(session);
         });
 
-        return details;
+        return section.details;
+    }
+
+    function buildWorldbookSection(session) {
+        const section = buildSideSection(session, 'worldbook', '世界書');
+        session.worldbookCount = section.count;
+
+        const row = createElement('div', 'stiae-reference-row');
+        const open = button('選條目', 'fa-book-open');
+        open.addEventListener('click', () => openWorldbookDialog(session));
+        // Beside 選條目 rather than under the list: picks are remembered across editors,
+        // so wanting rid of all of them is a thing you arrive wanting to do, and it should
+        // not need scrolling past the very rows you are clearing. Hidden while nothing is
+        // ticked so the section stays quiet on a fresh editor.
+        const clear = button('全部取消', 'fa-eraser', 'stiae-hidden');
+        clear.addEventListener('click', () => {
+            session.worldbookSelection.clear();
+            persistWorldbookSelection(session);
+            // No confirmation, matching the same button inside the picker: this drops a
+            // selection, not content, and one of the two asking would be the odd one out.
+            renderWorldbookList(session);
+            renderWorldbookSidebar(session);
+            scheduleContextRefresh(session);
+        });
+        row.append(open, clear);
+        const help = createElement('div', 'stiae-help', '唯讀，會記住。點一列可以看整條的內容。');
+        const notes = createElement('div', 'stiae-reference-notes');
+        const list = createElement('div', 'stiae-reference-list');
+
+        section.body.append(row, help, notes, list);
+        session.worldbookSideNotes = notes;
+        session.worldbookClear = clear;
+        session.worldbookList = list;
+        updateWorldbookSummary(session);
+        renderWorldbookSidebar(session);
+        return section.details;
+    }
+
+    // Moved out of the settings dialog in 0.8.0 and, with it, out of that dialog's draft
+    // model: a tick here takes effect and is saved immediately, exactly like a world info
+    // pick. That is the whole reason it moved — deciding which rules to run is part of
+    // setting up a request, not part of configuring the tool, and it was two clicks and a
+    // 儲存設定 away from the thing it changes.
+    //
+    // ⚠️ The settings dialog must not keep a copy. One list committed on save and one
+    // committed on tick is two checkboxes for one setting that can disagree.
+    function buildRegexSection(session) {
+        const section = buildSideSection(session, 'regex', '正則規則');
+        session.regexCount = section.count;
+        session.regexBody = section.body;
+        updateRegexSummary(session);
+        section.body.append(createElement('div', 'stiae-help', '正在讀取 SillyTavern 的正則規則…'));
+        // Read once per editor, like the world info catalogue: rules changed in
+        // SillyTavern while an editor is open need the editor reopened.
+        readTavernRegexes().then(rules => {
+            if (state.activeEditor !== session) return;
+            renderRegexRules(session, rules);
+        });
+        return section.details;
+    }
+
+    function renderRegexRules(session, rules) {
+        const body = session.regexBody;
+        if (!body) return;
+        body.replaceChildren();
+        body.append(createElement(
+            'div',
+            'stiae-help',
+            '套用在參考資料上。勾了就跑：不看深度、目的地，也不看它在 SillyTavern 裡是不是停用。所以可以建一條只給編輯用的規則。',
+        ));
+        body.append(createElement(
+            'div',
+            'stiae-help',
+            '唯一的例外是「來源」——寫給 AI 輸出的規則不會套到使用者樓層，反之亦然。',
+        ));
+        body.append(createElement(
+            'div',
+            'stiae-help',
+            '⚠ 代表那條規則有自己的條件，這裡會忽略。成套按深度分工的規則不要整組勾——條件被拿掉後它們會互相把內容刪光。',
+        ));
+        if (rules === null) {
+            body.append(createElement('div', 'stiae-reference-bad', '讀不到 SillyTavern 的正則規則。參考資料會以原始文字送出。'));
+            return;
+        }
+        const known = new Set(rules.map(rule => String(rule.id)));
+        const orphans = state.settings.regexRuleIds.filter(id => !known.has(id));
+        // Selections are stored by rule id, and character-scoped rules disappear
+        // with the character card. Saying so beats dropping them without a word.
+        if (orphans.length) {
+            body.append(createElement(
+                'div',
+                'stiae-reference-bad',
+                `有 ${orphans.length} 條已勾選的規則在目前角色下找不到，這次不會套用。切回原本的角色卡就會再出現。`,
+            ));
+        }
+        if (!rules.length) {
+            body.append(createElement('div', 'stiae-help', 'SillyTavern 裡目前沒有任何正則規則。'));
+            return;
+        }
+        const list = createElement('div', 'stiae-regex-list');
+        for (const rule of rules) {
+            const id = String(rule.id);
+            const label = createElement('label', 'stiae-regex-row');
+            const box = createElement('input');
+            box.type = 'checkbox';
+            box.checked = state.settings.regexRuleIds.includes(id);
+            const text = createElement('div');
+            text.append(createElement('strong', '', String(rule.script_name || '未命名規則')));
+            const marks = [rule.scope === 'character' ? '角色專屬' : '全域'];
+            if (!rule.enabled) marks.push('ST 中已停用');
+            const scopeNote = describeRuleScope(rule);
+            if (scopeNote) marks.push(scopeNote);
+            if (ruleUsesMacro(rule)) marks.push('含巨集，本工具不會展開');
+            text.append(createElement('div', 'stiae-help', marks.join(' · ')));
+            for (const override of describeRuleOverrides(rule)) {
+                text.append(createElement('div', 'stiae-regex-override', `⚠ ${override}`));
+            }
+            box.addEventListener('change', () => {
+                state.settings.regexRuleIds = box.checked
+                    ? [...new Set([...state.settings.regexRuleIds, id])]
+                    : state.settings.regexRuleIds.filter(value => value !== id);
+                // Saved on the tick, not on some later commit: an editor can be closed by
+                // a route that never reaches a save, and a rule selection that silently
+                // failed to stick is the annoyance this move exists to remove.
+                saveSettings();
+                updateRegexSummary(session);
+                scheduleContextRefresh(session);
+            });
+            label.append(box, text);
+            list.append(label);
+        }
+        body.append(list);
+    }
+
+    function buildSidebar(session) {
+        const side = createElement('aside', 'stiae-side');
+        const scroll = createElement('div', 'stiae-side-scroll');
+        scroll.append(buildFloorsSection(session), buildWorldbookSection(session), buildRegexSection(session));
+        const foot = createElement('div', 'stiae-side-foot');
+        const preview = button('預覽這次的請求', 'fa-eye');
+        preview.addEventListener('click', () => openRequestPreview(session));
+        foot.append(preview);
+        side.append(scroll, foot);
+        return side;
+    }
+
+    // The instruction is the one slot that is purely a variable: it lands at the top of
+    // the user message as `Task: …` and, when there is reference material, again at the
+    // bottom as the reminder. Both positions are the same whichever command is pressed,
+    // so a marker stands in for it.
+    const PREVIEW_INSTRUCTION = '〔這裡會換成你按下的那個指令的指示〕';
+
+    // What this request looks like before any command is pressed — built by the same
+    // buildPrompt() the real request uses, so the shape cannot drift from reality.
+    //
+    // ⚠️ The mode buttons are not decoration. The instruction may be a placeholder, but
+    // the protocol above it cannot be: 局部修補 and 全文改寫 are two entirely different
+    // system messages (search/replace pairs vs a single replacement block), and the
+    // patch-specific reference rule appears for one of them only. Picking one and
+    // calling it "the request" would show a protocol the user is not going to send.
+    //
+    // What this deliberately cannot show: a command carrying its own 編輯原則覆寫 sends
+    // that instead of the global principles. The note under the buttons says so, because
+    // a preview that quietly differs from the request is worse than no preview.
+    //
+    // The scope is read from the textarea at the moment it renders, so a selection is
+    // reflected — and nothing here freezes any offset, because nothing here is sent.
+    function openRequestPreview(session) {
+        if (state.activeRequestPreview || state.activeEditor !== session) return;
+
+        const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
+        const modal = createElement('section', 'stiae-settings-modal stiae-preview-modal');
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        const header = createElement('header', 'stiae-header');
+        header.append(createElement('strong', '', `預覽請求 · 第 ${session.messageId} 樓`));
+        const close = createElement('button', 'stiae-close', '×');
+        close.type = 'button';
+        close.title = '關閉';
+        header.append(close);
+
+        const body = createElement('div', 'stiae-preview-body');
+        const pick = createElement('div', 'stiae-preview-pick');
+        pick.append(createElement('span', '', '編輯模式：'));
+        const patchTab = button('局部修補', 'fa-code-merge');
+        const rewriteTab = button('全文改寫', 'fa-pen');
+        pick.append(patchTab, rewriteTab);
+        const modeHelp = createElement(
+            'div',
+            'stiae-help',
+            '指示的位置不論哪個指令都一樣，所以用佔位符代表。但兩種模式的輸出協定完全不同，要看哪一種請自己切。指令若有自己的「編輯原則覆寫」，實際送出的會是那一段，不是這裡顯示的全域編輯原則。',
+        );
+        const summary = createElement('div', 'stiae-help');
+        const content = createElement('div', 'stiae-preview-rows');
+        body.append(pick, modeHelp, summary, content);
+
+        const footer = createElement('footer', 'stiae-footer');
+        const copy = button('複製全文', 'fa-copy');
+        const done = button('關閉', 'fa-check', 'stiae-primary');
+        footer.append(copy, done);
+
+        modal.append(header, body, footer);
+        overlay.append(modal);
+        hostDocument.body.append(overlay);
+        state.activeRequestPreview = overlay;
+
+        let plain = '';
+        const render = async () => {
+            const mode = session.previewMode === 'replacement' ? 'replacement' : 'patch';
+            patchTab.classList.toggle('stiae-tab-on', mode === 'patch');
+            rewriteTab.classList.toggle('stiae-tab-on', mode === 'replacement');
+            // A stand-in for a real command: the placeholder instruction, the chosen mode,
+            // and no systemPrompt so buildPrompt falls through to the global principles.
+            const action = { instruction: PREVIEW_INSTRUCTION, mode, systemPrompt: '' };
+            const scope = scopeFromTextarea(session.textarea);
+            summary.textContent = '正在組裝…';
+            const reference = await refreshReference(session);
+            if (state.activeRequestPreview !== overlay) return;
+            const messages = buildPrompt(action, scope, session.role, {
+                referenceBlock: reference.block,
+                globalPrompt: state.settings.globalPrompt,
+            });
+            const size = messages.reduce((total, message) => total + message.content.length, 0);
+            summary.textContent = [
+                `${size.toLocaleString('en-US')} 字元（不含指示本身）`,
+                scope.hasSelection ? `可編輯範圍＝反白的 ${scope.end - scope.start} 個字元` : '可編輯範圍＝整個樓層',
+            ].join(' · ');
+            plain = messages.map(message => `${message.role}:\n${message.content}`).join('\n\n');
+            content.replaceChildren();
+            for (const message of messages) {
+                content.append(createElement('div', 'stiae-request-role', message.role === 'system'
+                    ? '系統訊息（協定與編輯原則）'
+                    : '使用者訊息（指示與內容）'));
+                content.append(createElement('pre', 'stiae-preview-pre', message.content));
+            }
+        };
+
+        const dismiss = () => {
+            if (state.activeRequestPreview !== overlay) return;
+            state.activeRequestPreview = null;
+            hostDocument.removeEventListener('keydown', onKey, true);
+            overlay.remove();
+        };
+        function onKey(event) {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            event.stopPropagation();
+            dismiss();
+        }
+
+        patchTab.addEventListener('click', () => { session.previewMode = 'patch'; render(); });
+        rewriteTab.addEventListener('click', () => { session.previewMode = 'replacement'; render(); });
+        copy.addEventListener('click', async () => {
+            try {
+                await hostWindow.navigator.clipboard.writeText(plain);
+                toast('success', '已複製到剪貼簿。');
+            } catch {
+                toast('error', '瀏覽器不允許複製，請自己選取。');
+            }
+        });
+        close.addEventListener('click', dismiss);
+        done.addEventListener('click', dismiss);
+        overlay.addEventListener('mousedown', event => {
+            if (event.target === overlay) dismiss();
+        });
+        hostDocument.addEventListener('keydown', onKey, true);
+        render();
     }
 
     // Replaces window.confirm(), which cannot be relied on here.
@@ -2743,11 +3291,15 @@
         }
         hostWindow.clearTimeout(session.referenceTimer);
         hostWindow.clearTimeout(session.worldbookTimer);
-        hostWindow.clearTimeout(session.worldbookRefreshTimer);
-        // The picker belongs to this editor. Left open it would go on ticking entries
-        // into a session that no longer has anywhere to send them.
+        hostWindow.clearTimeout(session.contextRefreshTimer);
+        // These windows belong to this editor. Left open they would go on ticking entries
+        // into, or previewing a request for, a session that no longer exists.
         state.activeWorldbook?.remove();
         state.activeWorldbook = null;
+        state.activeTextPreview?.remove();
+        state.activeTextPreview = null;
+        state.activeRequestPreview?.remove();
+        state.activeRequestPreview = null;
         captureEditorRect(session.modal);
         session.overlay.remove();
         state.activeEditor = null;
@@ -2823,11 +3375,17 @@
         header.append(close);
         const toolbar = createElement('div', 'stiae-toolbar');
         const scopeNotice = createElement('div', 'stiae-scope');
+        // The text and the sidebar are siblings inside one row from 0.8.0. Before that
+        // everything was one column and the reference section competed with the textarea
+        // for the same vertical space.
+        const main = createElement('div', 'stiae-main');
+        const workspace = createElement('div', 'stiae-workspace');
         const body = createElement('div', 'stiae-editor-body');
         const textarea = createElement('textarea', 'stiae-editor-text');
         textarea.value = message.message;
         textarea.spellcheck = false;
         body.append(textarea);
+        workspace.append(scopeNotice, body);
         const footer = createElement('footer', 'stiae-footer');
         const cancel = button('取消', 'fa-xmark');
         const save = button('儲存樓層', 'fa-check', 'stiae-primary');
@@ -2868,7 +3426,12 @@
             worldbookRememberedLoading: false,
             worldbookQuery: '',
             worldbookTimer: null,
-            worldbookRefreshTimer: null,
+            contextRefreshTimer: null,
+            // Which protocol the request preview is showing. Editor-scoped like the
+            // one-off command, so reopening it stays where it was left. 局部修補 first
+            // because it is the mode a new command starts on and the one whose protocol
+            // has an extra rule that only shows up with reference material attached.
+            previewMode: 'patch',
             // Kept only for this editor's lifetime so re-opening "臨時指令" after a run
             // starts pre-filled instead of blank. Not persisted to settings — a fresh
             // editor on a different floor (or reopening this one) starts empty again.
@@ -2879,7 +3442,8 @@
             : [];
         state.activeEditor = session;
 
-        modal.append(header, toolbar, scopeNotice, buildReferenceSection(session), body, footer);
+        main.append(workspace, buildSidebar(session));
+        modal.append(header, toolbar, main, footer);
         overlay.append(modal);
         hostDocument.body.append(overlay);
         placeEditorModal(modal);
@@ -4392,94 +4956,6 @@
         checkUpdate.addEventListener('click', () => checkForUpdate());
         installUpdate.addEventListener('click', () => runUpdate());
 
-        // Persistent, and collapsed by default. The list can run to dozens of rows, and
-        // the dialog is already one long scroll — but the summary states the count, so
-        // the setting is never invisible.
-        const regexSection = createElement('details', 'stiae-regex-section');
-        const regexSummary = createElement('summary', 'stiae-field-label');
-        const regexBody = createElement('div', 'stiae-regex-body');
-        regexSection.append(regexSummary, regexBody);
-
-        // 「正則規則」carries the heading; what it applies to and how many are ticked ride
-        // along in the smaller note. The count has to stay visible somewhere — this
-        // section is collapsed by default, and a silently-collapsed setting is invisible.
-        const updateRegexSummary = () => {
-            regexSummary.replaceChildren(
-                createElement('span', '', '正則規則'),
-                createElement('span', 'stiae-label-note', `套用在參考資料上 · 已勾選 ${draft.regexRuleIds.length} 條`),
-            );
-        };
-
-        const renderRegexRules = rules => {
-            regexBody.replaceChildren();
-            regexBody.append(createElement(
-                'div',
-                'stiae-help',
-                '勾了就跑：不看深度、目的地，也不看它在 SillyTavern 裡是不是停用。所以可以建一條只給編輯用的規則。',
-            ));
-            regexBody.append(createElement(
-                'div',
-                'stiae-help',
-                '唯一的例外是「來源」——寫給 AI 輸出的規則不會套到使用者樓層，反之亦然。',
-            ));
-            regexBody.append(createElement(
-                'div',
-                'stiae-help',
-                '⚠ 代表那條規則有自己的條件，這裡會忽略。成套按深度分工的規則不要整組勾——條件被拿掉後它們會互相把內容刪光。',
-            ));
-            if (rules === null) {
-                regexBody.append(createElement('div', 'stiae-reference-bad', '讀不到 SillyTavern 的正則規則。參考資料會以原始文字送出。'));
-                return;
-            }
-            const known = new Set(rules.map(rule => String(rule.id)));
-            const orphans = draft.regexRuleIds.filter(id => !known.has(id));
-            // Selections are stored by rule id, and character-scoped rules disappear
-            // with the character card. Saying so beats dropping them without a word.
-            if (orphans.length) {
-                regexBody.append(createElement(
-                    'div',
-                    'stiae-reference-bad',
-                    `有 ${orphans.length} 條已勾選的規則在目前角色下找不到，這次不會套用。切回原本的角色卡就會再出現。`,
-                ));
-            }
-            if (!rules.length) {
-                regexBody.append(createElement('div', 'stiae-help', 'SillyTavern 裡目前沒有任何正則規則。'));
-                return;
-            }
-            const list = createElement('div', 'stiae-regex-list');
-            for (const rule of rules) {
-                const id = String(rule.id);
-                const label = createElement('label', 'stiae-regex-row');
-                const box = createElement('input');
-                box.type = 'checkbox';
-                box.checked = draft.regexRuleIds.includes(id);
-                const text = createElement('div');
-                text.append(createElement('strong', '', String(rule.script_name || '未命名規則')));
-                const marks = [rule.scope === 'character' ? '角色專屬' : '全域'];
-                if (!rule.enabled) marks.push('ST 中已停用');
-                const scopeNote = describeRuleScope(rule);
-                if (scopeNote) marks.push(scopeNote);
-                if (ruleUsesMacro(rule)) marks.push('含巨集，本工具不會展開');
-                text.append(createElement('div', 'stiae-help', marks.join(' · ')));
-                for (const override of describeRuleOverrides(rule)) {
-                    text.append(createElement('div', 'stiae-regex-override', `⚠ ${override}`));
-                }
-                box.addEventListener('change', () => {
-                    draft.regexRuleIds = box.checked
-                        ? [...new Set([...draft.regexRuleIds, id])]
-                        : draft.regexRuleIds.filter(value => value !== id);
-                    updateRegexSummary();
-                });
-                label.append(box, text);
-                list.append(label);
-            }
-            regexBody.append(list);
-        };
-
-        updateRegexSummary();
-        regexBody.append(createElement('div', 'stiae-help', '正在讀取 SillyTavern 的正則規則…'));
-        readTavernRegexes().then(renderRegexRules);
-
         renderBuiltins();
         renderCommands();
         body.append(
@@ -4498,7 +4974,11 @@
             // No divider elements between the blocks: .stiae-field-label carries its own
             // rule and spacing, so each heading separates itself from what came before.
             // Having both drew two lines with a gap trapped between them.
-            regexSection,
+            //
+            // ⚠️ 正則規則 used to sit here. It moved to the editor's sidebar in 0.8.0 and
+            // must not come back: there it is ticked and saved on the spot, and a second
+            // copy on this dialog's draft model would commit on 儲存設定 instead — two
+            // checkboxes for one setting, free to disagree.
             backupHeader,
             backupRow,
             backupHelp,
@@ -4539,6 +5019,12 @@
             // same dialog and saves its result immediately; copying the draft's stale
             // value over it would throw away the answer the user just asked for.
             draft.updateLatestVersion = state.settings.updateLatestVersion;
+            // Same rule, for the settings this dialog no longer owns. The regex selection
+            // and the sidebar's fold state are written the moment they change, out in the
+            // editor; the draft is a snapshot from when this dialog opened, and writing it
+            // back would quietly undo them.
+            draft.regexRuleIds = state.settings.regexRuleIds;
+            draft.sidebarSections = state.settings.sidebarSections;
             return normalizeSettings(draft);
         };
 
@@ -4564,6 +5050,16 @@
             saveSettings();
             if (state.activeEditor) {
                 renderEditorToolbar(state.activeEditor);
+                // ⚠️ An import replaces the two selections the sidebar is showing. Without
+                // this the counts would follow the new settings while the boxes below them
+                // still showed the old ticks — the sidebar contradicting itself, in plain
+                // sight and with nothing to explain it.
+                state.activeEditor.worldbookSelection = new Map(state.settings.worldbookSelection
+                    .map(ref => [worldbookEntryKey(ref.book, ref.uid), ref]));
+                readTavernRegexes().then(rules => {
+                    if (state.activeEditor) renderRegexRules(state.activeEditor, rules);
+                });
+                loadRememberedWorldbooks(state.activeEditor);
                 refreshReference(state.activeEditor);
             }
             const from = parsed.sourceVersion ? `（來源版本 ${parsed.sourceVersion}）` : '';
@@ -4607,8 +5103,11 @@
         }
         // A confirmation handles its own Escape; letting this run too would close the
         // editor out from under the question it is asking. Same for the world info
-        // picker — it is a window in its own right and answers Escape itself.
-        if (event.key === 'Escape' && state.activeEditor && !state.activeReview && !state.activeSettings && !state.activeConfirm && !state.activeWorldbook) {
+        // picker and the two preview windows — each is a window in its own right and
+        // answers Escape itself. Missing one from this list means Escape closes the
+        // editor, and the draft with it, while the user is only reading something.
+        if (event.key === 'Escape' && state.activeEditor && !state.activeReview && !state.activeSettings
+            && !state.activeConfirm && !state.activeWorldbook && !state.activeTextPreview && !state.activeRequestPreview) {
             requestCloseEditor(state.activeEditor);
         }
     }
@@ -4620,6 +5119,8 @@
         state.activeReview?.close?.();
         state.activeSettings?.remove?.();
         state.activeWorldbook?.remove?.();
+        state.activeTextPreview?.remove?.();
+        state.activeRequestPreview?.remove?.();
         state.activeEditor?.overlay?.remove?.();
         hostDocument.removeEventListener('click', onDocumentClick, true);
         hostDocument.removeEventListener('keydown', onDocumentKeydown, true);
