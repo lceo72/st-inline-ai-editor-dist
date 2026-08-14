@@ -12,6 +12,7 @@
  *
  *   ══════ 常數與輸出協定 ══════
  *   ══════ 純函式：設定與客製指令 ══════
+ *   ══════ 純函式：API 端點與回應 ══════
  *   ══════ 純函式：解析模型輸出 ══════
  *   ══════ 純函式：差異比對與逐行取捨 ══════
  *   ══════ 純函式：參考樓層範圍 ══════
@@ -25,6 +26,7 @@
  *   ══════ 宿主 API 包裝：樓層、正則、世界書 ══════
  *   ══════ 編輯器介面：魔杖、視窗、參考資料 ══════
  *   ══════ 編輯器行為：開啟、儲存、關閉 ══════
+ *   ══════ API 請求：直連與代發 ══════
  *   ══════ 差異視窗與審核流程 ══════
  *   ══════ 更新：檢查與寫回腳本庫 ══════
  *   ══════ 表單與設定視窗 ══════
@@ -39,13 +41,112 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.8.0';
+    const VERSION = '0.9.0';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
     const ROOT_CLASS = 'stiae-root';
 
     const DEFAULT_GLOBAL_PROMPT = 'Preserve the source\'s Markdown structure, character voice, narrative POV, and established facts.';
+
+    // The heading ships inside the card's own text rather than being welded on at
+    // assembly time. That is what lets the default arrangement produce byte-for-byte
+    // what 0.8.0 produced while still leaving the line as something the user can delete.
+    const DEFAULT_PRINCIPLES_CARD = `Editing principles:\n${DEFAULT_GLOBAL_PROMPT}`;
+
+    // Three slots whose text is produced at send time. The user can drag them and, for
+    // 參考資料, watch them fall away when there is nothing to put in them — but the words
+    // are not theirs to edit, and neither is the position of the two pinned ones.
+    const SYSTEM_CARD_SLOTS = {
+        instruction: { name: '指示', help: '你按下的那個指令，要 AI 做什麼。' },
+        reference: { name: '參考資料', help: '你在編輯器裡勾的參考樓層與世界書。一條都沒勾時整段不送出。' },
+        target: { name: '目標內文', help: '要編修的那一段文字。有帶參考資料時，結尾會自動再講一次你的指令，免得被前面一大段蓋過去。' },
+    };
+
+    // ⚠️ Both pinned cards exist because this tool's output travels back to be matched
+    // against the original text character for character and then written into the chat
+    // (ADR-0006). 協定 first: the parser's contract. 目標內文 last: it is the single
+    // ordering rule that makes "reference material after the prose being edited" — the
+    // one arrangement that reliably goes wrong — impossible to express.
+    const PINNED_FIRST = 'protocol';
+    const PINNED_LAST = 'target';
+
+    // Half-width, unlike the wrapper marks in MARK. A tag the user writes is read by the
+    // model as structure, and half-width is the form it has seen countless times. The
+    // full-width wrappers guard against a chat message containing the same spelling;
+    // that risk barely exists in a card the user typed themselves.
+    //
+    // ⚠️ search / replace are refused. The model has to emit those two itself and the
+    // parser rests entirely on them, so a user-made block boundary of the same name
+    // would hand the parser to luck.
+    const RESERVED_TAGS = ['search', 'replace', 'replacement'];
+
+    // ⚠️ One spelling, used by the checkbox AND by the error message that tells people to
+    // tick it. Written out twice, a rename leaves the error pointing at a switch that no
+    // longer exists by that name — and that sentence is the only way anyone finds the
+    // switch at all. core.test.cjs asserts the message contains this constant.
+    const BACKEND_SWITCH_LABEL = '改由酒館的伺服器幫忙送出';
+
+    const MESSAGE_ROLE_LABELS = {
+        system: '系統訊息（system）',
+        user: '使用者訊息（user）',
+        assistant: 'AI 訊息（assistant）',
+    };
+
+    // ⚠️ Must stay ABOVE readChangelogFromSource, and the reader's capture must start
+    // with a digit — exactly the lesson readVersionFromSource records. The reader's own
+    // regex literal contains the text `const CHANGELOG = ` and would otherwise match
+    // itself, handing back its own spelling as the newest release notes.
+    //
+    // Only the last ten releases live here. This string ships inside every copy of the
+    // script and an unbounded one would grow the file forever.
+    const CHANGELOG = `0.9.0
+- 模型連線改用工具自己的「API 設定」，不再借用 SillyTavern 的 Connection Profile。可以存好幾組，指令能各自指定要用哪一組。
+- 升級後要重新填一次端點與金鑰：金鑰存在酒館伺服器裡，這裡讀不到，搬不過來。
+- 編修請求不再被主聊天的 preset 罩住。送出去的東西現在完全由這個工具決定。
+- 端點撞到跨域限制時，可以改由酒館伺服器代發。錯誤訊息會直接告訴你去勾哪裡。
+- 提示詞改成一份模組清單，看得到協定、指示、參考資料、內文各自排在哪裡，也可以插入自己的模組。
+- 設定視窗拆成四個分頁：API 設定、指令設定、提示詞設定、版本日誌與設定備份。
+- 「複製設定代碼」不再包含 API 金鑰。
+
+0.8.0
+- 這次要帶什麼給 AI，全部搬到編輯器右邊的側邊欄，不再擠佔正文。
+- 勾了哪幾條世界書一眼看得到，可以逐條檢視或取消。
+- 點參考樓層可以直接看那一樓的完整內文，正則改動過的還能對照原始內容。
+- 正則勾選搬到側邊欄，勾了立刻生效。
+- 側邊欄最下面多了「預覽這次的請求」。
+
+0.7.2
+- 修正內建指令那四列的排版跑掉（只在 0.7.1 出現過）。
+
+0.7.1
+- 修好「更多」選單被工具列裁掉，實測只露出 4px。
+- 分組變成工具列上的資料夾按鈕，指令可以拖曳排序、拖到別組。
+- 「複製設定／貼上設定」改名為「複製設定代碼／匯入設定代碼」。
+
+0.7.0
+- 選世界書條目改成獨立視窗，搜尋框與書本選單不會被捲走。
+- 客製指令可以分組，也可以只複製指令代碼分享出去。
+- 新增「檢查更新」與「更新腳本」，按下去才連外網。
+
+0.6.1
+- 魔杖從 ⋯ 選單拉到樓層動作列上，少按一次。
+- 修正窄螢幕上「查看整個樓層的修改位置」排版錯亂。
+
+0.6.0
+- 差異視窗每一個有變更的行都能個別勾選要不要採用，預設全勾。
+- 局部修補與全文改寫都適用。
+
+0.5.1
+- 臨時指令在同一個編輯器裡會記住剛剛打的字。
+
+0.5.0
+- 世界書條目可以勾選當參考資料，勾選會記住。
+- 參考樓層只在同一個聊天裡記住，換聊天自動清空。
+
+0.4.0
+- 新增附加參考資料與正則勾選。
+- 內建指令可以編輯，並新增設定備份。`;
 
     // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
     // whose value is "run this in my browser" — the whole safety of this feature rests on
@@ -188,14 +289,187 @@
             icon: ICONS.some(([value]) => value === command?.icon) ? command.icon : ICONS[0][0],
             instruction: String(command?.instruction || ''),
             mode: command?.mode === 'replacement' ? 'replacement' : 'patch',
-            systemPrompt: String(command?.systemPrompt || ''),
-            profileId: String(command?.profileId || ''),
-            profileName: String(command?.profileName || ''),
-            maxTokens: Number.isFinite(Number(command?.maxTokens)) && Number(command.maxTokens) > 0
-                ? Math.round(Number(command.maxTokens))
-                : null,
+            // Which API 設定 this command uses. Empty means the default one.
+            //
+            // ⚠️ 0.8.0's profileId / profileName are dropped rather than carried across.
+            // A Connection Profile id names something in SillyTavern that this tool no
+            // longer talks to (ADR-0005), and the key that would make it usable — the
+            // API key — lives in the server's secrets and was never readable from here.
+            apiConfigId: String(command?.apiConfigId || ''),
+            // null means 跟隨全域 — this command has no list of its own and uses the one
+            // in settings. An array means the user has edited it, and it froze at that
+            // moment (ADR-0007). ⚠️ Not `|| null`: an empty array is a real answer (the
+            // user deleted every card they could delete) and must not collapse back into
+            // "follow the global list".
+            promptCards: Array.isArray(command?.promptCards)
+                ? normalizePromptCards(command.promptCards)
+                : migrateSystemPromptToCards(command?.systemPrompt),
             visible: command?.visible !== false,
         };
+    }
+
+    // 0.8.0 stored a command's 編輯原則覆寫 as one block of text that replaced the global
+    // principles outright. It becomes exactly one frozen card carrying that same text,
+    // with no other user card beside it — so the bytes this command sends do not change
+    // on the release that introduces cards. Nothing stored means 跟隨全域.
+    function migrateSystemPromptToCards(systemPrompt) {
+        const text = String(systemPrompt || '').trim();
+        if (!text) return null;
+        return normalizePromptCards([
+            { kind: 'protocol' },
+            { kind: 'user', name: '編輯原則', content: `Editing principles:\n${text}`, role: 'system' },
+            { kind: 'system', slot: 'instruction' },
+            { kind: 'system', slot: 'reference' },
+            { kind: 'system', slot: 'target' },
+        ]);
+    }
+
+    // A tag turns a user card into `<name>…</name>`. Angle brackets and whitespace are
+    // stripped rather than rejected: someone typing what they want the tag to look like
+    // writes `<style_guide>`, and refusing that is a worse answer than understanding it.
+    //
+    // ⚠️ The reserved names are refused outright. search / replace / replacement are the
+    // three tags the model has to emit itself, and the parser's correctness rests on
+    // them; a user-made block boundary of the same name hands the parser to luck.
+    function sanitizePromptTag(value) {
+        const tag = String(value || '').replace(/[<>\s/]/g, '');
+        if (!tag) return '';
+        return RESERVED_TAGS.includes(tag.toLowerCase()) ? '' : tag;
+    }
+
+    function normalizePromptCard(card) {
+        const kind = card?.kind === 'protocol' || card?.kind === 'system' ? card.kind : 'user';
+        if (kind === 'protocol') return { id: 'protocol', kind: 'protocol' };
+        if (kind === 'system') {
+            const slot = Object.prototype.hasOwnProperty.call(SYSTEM_CARD_SLOTS, card?.slot) ? card.slot : null;
+            return slot ? { id: `system-${slot}`, kind: 'system', slot } : null;
+        }
+        return {
+            id: String(card?.id || makeId('card')),
+            kind: 'user',
+            name: String(card?.name || '未命名模組'),
+            content: String(card?.content || ''),
+            tag: sanitizePromptTag(card?.tag),
+            // Only user cards choose. The protocol is a system message because that is
+            // what it is, and the three generated cards ride in the user turn — those
+            // roles are part of the contract, not a preference (ADR-0006).
+            role: ['system', 'user', 'assistant'].includes(card?.role) ? card.role : 'user',
+            enabled: card?.enabled !== false,
+        };
+    }
+
+    // The factory arrangement, and the one the literal-string test in core.test.cjs
+    // locks: it must assemble into exactly the bytes 0.8.0 sent.
+    function defaultPromptCards() {
+        return normalizePromptCards([
+            { kind: 'protocol' },
+            { kind: 'user', name: '編輯原則', content: DEFAULT_PRINCIPLES_CARD, role: 'system' },
+            { kind: 'system', slot: 'instruction' },
+            { kind: 'system', slot: 'reference' },
+            { kind: 'system', slot: 'target' },
+        ]);
+    }
+
+    // Rebuilds the invariant rather than trusting the stored order: 協定 first, 目標內文
+    // last, exactly one of each generated card present somewhere. Stored data can be
+    // hand-edited, imported from another version, or truncated — and a list missing its
+    // 可編輯範圍 card would still assemble, still send, and still come back to be written
+    // into the chat. The structure has to be re-established, not validated.
+    //
+    // ⚠️ This runs inside normalizeSettings, so it must be stable: an unstable pass would
+    // shuffle the user's cards a little more on every save, with nobody touching them.
+    function normalizePromptCards(raw) {
+        const source = Array.isArray(raw) ? raw : [];
+        const middle = [];
+        const seenSlots = new Set();
+        for (const entry of source) {
+            const card = normalizePromptCard(entry);
+            if (!card) continue;
+            if (card.kind === 'protocol') continue;
+            if (card.kind === 'system') {
+                if (card.slot === PINNED_LAST || seenSlots.has(card.slot)) continue;
+                seenSlots.add(card.slot);
+            }
+            middle.push(card);
+        }
+        // A generated card the stored list has lost is appended rather than dropped. It
+        // carries text the request cannot do without, and losing 指示 silently would send
+        // the model prose with no task attached.
+        for (const slot of Object.keys(SYSTEM_CARD_SLOTS)) {
+            if (slot === PINNED_LAST || seenSlots.has(slot)) continue;
+            middle.push({ id: `system-${slot}`, kind: 'system', slot });
+        }
+        return [
+            { id: PINNED_FIRST, kind: 'protocol' },
+            ...middle,
+            { id: `system-${PINNED_LAST}`, kind: 'system', slot: PINNED_LAST },
+        ];
+    }
+
+    function isPinnedCard(card) {
+        return card?.kind === 'protocol' || (card?.kind === 'system' && card.slot === PINNED_LAST);
+    }
+
+    // Which list a command actually sends. null means 跟隨全域 (ADR-0007).
+    function resolvePromptCards(settings, command) {
+        const own = command?.promptCards;
+        if (Array.isArray(own)) return normalizePromptCards(own);
+        return normalizePromptCards(settings?.promptCards);
+    }
+
+    // One connection the tool talks to. Everything a request needs is in here, including
+    // the two generation knobs — a command that names an API 設定 takes the whole group,
+    // never a field from one and a field from another (the same call ADR-0002 made).
+    function normalizeApiConfig(config, index = 0) {
+        const maxTokens = Number(config?.maxTokens);
+        return {
+            id: String(config?.id || makeId('api')),
+            name: String(config?.name || `API 設定 ${index + 1}`),
+            // Taken literally. Nothing is appended, nothing is guessed: /chat/completions
+            // and /models are hung off whatever is here. Guessing a missing /v1 is how
+            // story-oracle ended up needing a second switch to undo the first one.
+            endpoint: String(config?.endpoint || '').trim().replace(/\/+$/, ''),
+            apiKey: String(config?.apiKey || ''),
+            model: String(config?.model || '').trim(),
+            // Blank means "do not send temperature at all". Some models reject the
+            // parameter outright, and a blank field says that better than a checkbox —
+            // it is the same "blank means inherit, not blank means empty" this project
+            // already uses everywhere else.
+            temperature: config?.temperature === '' || config?.temperature === null || config?.temperature === undefined
+                ? null
+                : (Number.isFinite(Number(config.temperature)) ? Number(config.temperature) : null),
+            maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.round(maxTokens) : 2048,
+            // Per group, not global: whether a provider refuses browser requests is a
+            // property of that provider, not a preference of the user's.
+            viaBackend: config?.viaBackend === true,
+            stream: config?.stream !== false,
+        };
+    }
+
+    function normalizeApiConfigs(raw) {
+        if (!Array.isArray(raw)) return [];
+        const seen = new Set();
+        const list = [];
+        for (const entry of raw) {
+            const config = normalizeApiConfig(entry, list.length);
+            if (seen.has(config.id)) config.id = makeId('api');
+            seen.add(config.id);
+            list.push(config);
+        }
+        return list;
+    }
+
+    // Which connection a command sends through: its own if it names one that still
+    // exists, otherwise the default. A command pointing at a deleted API 設定 falls back
+    // rather than failing — but the settings dialog says so, because a silent fallback
+    // to a different model is exactly the kind of thing this project refuses to hide.
+    function resolveApiConfig(settings, command) {
+        const list = Array.isArray(settings?.apiConfigs) ? settings.apiConfigs : [];
+        const wanted = command?.apiConfigId
+            ? list.find(config => config.id === command.apiConfigId)
+            : null;
+        if (wanted) return wanted;
+        return list.find(config => config.id === settings?.defaultApiConfigId) || list[0] || null;
     }
 
     // Groups are a view of the stored order, not a second ordering to keep in step with
@@ -274,17 +548,32 @@
         return typeof value === 'boolean' ? value : fallback;
     }
 
+    // 0.8.0's 全域編輯原則 was one textarea. It becomes the factory arrangement with that
+    // text inside the 編輯原則 card — same bytes out, different container.
+    function migrateGlobalPromptToCards(globalPrompt) {
+        const text = String(globalPrompt ?? '').trim() || DEFAULT_GLOBAL_PROMPT;
+        const cards = defaultPromptCards();
+        const principles = cards.find(card => card.kind === 'user');
+        if (principles) principles.content = `Editing principles:\n${text}`;
+        return cards;
+    }
+
     function normalizeSettings(raw) {
         const settings = raw && typeof raw === 'object' ? raw : {};
         const rect = settings.editorRect && typeof settings.editorRect === 'object' ? settings.editorRect : {};
         return {
             version: VERSION,
-            defaultProfileId: String(settings.defaultProfileId || ''),
-            defaultProfileName: String(settings.defaultProfileName || ''),
-            globalPrompt: String(settings.globalPrompt || DEFAULT_GLOBAL_PROMPT),
-            defaultMaxTokens: Number.isFinite(Number(settings.defaultMaxTokens)) && Number(settings.defaultMaxTokens) > 0
-                ? Math.round(Number(settings.defaultMaxTokens))
-                : 2048,
+            // ⚠️ 0.8.0's defaultProfileId / defaultProfileName / defaultMaxTokens /
+            // globalPrompt are read here and then gone. Dropping a key this way is safe
+            // because normalizeSettings rebuilds the whole object; what must not happen
+            // is an old payload making the read throw, because the catch around it hands
+            // back defaults and the user's custom commands evaporate.
+            apiConfigs: normalizeApiConfigs(settings.apiConfigs),
+            defaultApiConfigId: String(settings.defaultApiConfigId || ''),
+            // The global card list. A command with no list of its own sends this one.
+            promptCards: Array.isArray(settings.promptCards)
+                ? normalizePromptCards(settings.promptCards)
+                : migrateGlobalPromptToCards(settings.globalPrompt),
             lastCustomMode: settings.lastCustomMode === 'replacement' ? 'replacement' : 'patch',
             // The result of the last time 檢查更新 was pressed. Remembered only so the dot
             // on the settings button survives a page reload — nothing here ever triggers a
@@ -382,6 +671,83 @@
         };
     }
 
+    // ══════ 純函式：API 端點與回應 ══════
+
+    // ⚠️ The endpoint is used literally. Nothing is appended to make a bare host look
+    // like an API base, and no /v1 is guessed — the field is labelled 端點（基礎網址）and
+    // that is taken at its word. story-oracle guesses a missing /v1 and then needs a
+    // second switch (地址原樣使用) to turn the guess back off; two switches for a problem
+    // it created itself.
+    //
+    // The one thing recognised is an exact /chat/completions suffix, and that is not a
+    // guess: it is the same address spelled out in full, and pasting the full URL is what
+    // a provider's own documentation usually shows.
+    function endpointChatUrl(endpoint) {
+        const base = String(endpoint || '').trim().replace(/\/+$/, '');
+        if (!base) return '';
+        return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
+    }
+
+    function endpointModelsUrl(endpoint) {
+        const base = String(endpoint || '').trim().replace(/\/+$/, '');
+        if (!base) return '';
+        if (/\/chat\/completions$/.test(base)) return base.replace(/\/chat\/completions$/, '/models');
+        return /\/models$/.test(base) ? base : `${base}/models`;
+    }
+
+    // OpenAI answers { data: [{ id }] }. Relays answer with a bare array or { models: […] }
+    // often enough that refusing those would report "no models" on connections that work.
+    function extractModelIds(data) {
+        const list = Array.isArray(data?.data) ? data.data
+            : Array.isArray(data) ? data
+            : Array.isArray(data?.models) ? data.models
+            : [];
+        const ids = list
+            .map(entry => (typeof entry === 'string' ? entry : (entry?.id || entry?.name)))
+            .filter(Boolean)
+            .map(String);
+        return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+    }
+
+    // ⚠️ Some relays ignore `stream: true` and answer with an ordinary completion instead
+    // of an event stream. Scanning that for `data:` lines finds nothing and returns an
+    // empty string, which upstream reads as "the model said nothing" and silently falls
+    // through to replacing the whole scope. This is the fallback that reads it as what it
+    // actually is. Returns '' when the body is neither, so the caller can report an empty
+    // reply honestly.
+    function extractNonStreamContent(raw) {
+        if (!String(raw ?? '').trim()) return '';
+        try {
+            const data = JSON.parse(raw);
+            return String(data?.choices?.[0]?.message?.content ?? '');
+        } catch {
+            return '';
+        }
+    }
+
+    // ⚠️ A browser refused by CORS reports `TypeError: Failed to fetch` and nothing else —
+    // no status, no reason, and the console message is indistinguishable from being
+    // offline. Without this translation the 經酒館伺服器代發 switch may as well not exist,
+    // because the person who needs it has no way to know it is the answer.
+    function describeRequestError(error, viaBackend = false) {
+        const status = Number(error?.status) || 0;
+        const message = String(error?.message || error || '');
+        if (status === 401 || status === 403) {
+            return `這組 API 設定的金鑰被拒絕了（HTTP ${status}）。請確認金鑰有沒有貼完整、有沒有過期。`;
+        }
+        if (status === 404) {
+            return '找不到這個網址（HTTP 404）。這個工具不會幫你補網址，請對照服務商的文件看看有沒有漏掉結尾——最常見的是少了 /v1。';
+        }
+        if (status) return `服務商回覆 HTTP ${status}。${message}`.trim();
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return '請求逾時。';
+        if (error?.name === 'TypeError' || /failed to fetch|networkerror|load failed/i.test(message)) {
+            return viaBackend
+                ? '酒館的伺服器也連不上這個網址。請先確認網址沒打錯；詳細原因會出現在酒館伺服器的主控台。'
+                : `連不上這個網址。最常見的原因是這個服務商不允許網頁直接連它（瀏覽器的安全限制，不是你設定錯）——請到這組 API 設定裡勾選「${BACKEND_SWITCH_LABEL}」再試一次。`;
+        }
+        return message || '請求失敗，但沒有回傳原因。';
+    }
+
     // ══════ 純函式：解析模型輸出 ══════
 
     function stripOuterCodeFence(text) {
@@ -397,11 +763,23 @@
     const SETTINGS_EXPORT_FORMAT = 'st-inline-ai-editor-settings';
     const COMMANDS_EXPORT_FORMAT = 'st-inline-ai-editor-commands';
 
+    // ⚠️ API keys are stripped, and this is the only place that can do it. README tells
+    // people to copy this code and paste it into the new version; it gets pasted into
+    // notes, chat apps and help requests, and it looks like meaningless noise while
+    // being a live credential. Everything else about a connection survives, so the only
+    // cost is typing the key in again (ADR-0005).
+    //
+    // Deliberately not offered as a choice at export time: that turns a safe default
+    // into a decision made in a hurry, and getting it wrong leaves no trace at all.
     function serializeSettings(settings) {
+        const normalized = normalizeSettings(settings);
         return JSON.stringify({
             format: SETTINGS_EXPORT_FORMAT,
             version: VERSION,
-            settings: normalizeSettings(settings),
+            settings: {
+                ...normalized,
+                apiConfigs: normalized.apiConfigs.map(config => ({ ...config, apiKey: '' })),
+            },
         }, null, 2);
     }
 
@@ -434,8 +812,13 @@
     }
 
     // Custom commands travel on their own so a set of them can be handed to someone else
-    // (or kept as a separate backup) without carrying the Connection Profile, the editing
-    // principles and every builtin override along with it.
+    // (or kept as a separate backup) without carrying the API 設定, the prompt cards and
+    // every builtin override along with it.
+    //
+    // ⚠️ A command's apiConfigId names something that only exists in the sender's own
+    // settings, so it is dropped on import rather than kept as a dangling reference. A
+    // dropped id means "use the default group", which is a real behaviour the recipient
+    // can see; a kept one would point at nothing and fail only when the button is pressed.
     //
     // A distinct `format` from the whole-settings backup, so pasting one into the other's
     // box is refused with a sentence that says which box it belongs in — rather than
@@ -478,7 +861,11 @@
         }
         return {
             ok: true,
-            commands: payload.commands.map(normalizeCommand),
+            // ⚠️ apiConfigId is cleared on the way in. The id names a group in the
+            // sender's settings and cannot exist here; keeping it would leave the command
+            // pointing at nothing, and that only surfaces when the button is pressed.
+            // Blank means 用預設那組 — a real, visible answer.
+            commands: payload.commands.map(command => normalizeCommand({ ...command, apiConfigId: '' })),
             sourceVersion: String(payload.version || ''),
         };
     }
@@ -1051,9 +1438,52 @@
     // the extra protocol sentence and the reference block all appear only when there
     // is reference material to justify them — otherwise this release would quietly
     // change the behaviour of every existing command.
+    // What each card turns into at send time. null means the card contributes nothing —
+    // an emptied user card, a disabled one, or 參考資料 with nothing ticked.
+    function renderPromptCard(card, parts) {
+        if (card.kind === 'protocol') return { role: 'system', content: parts.protocol };
+        if (card.kind === 'system') {
+            if (card.slot === 'instruction') return { role: 'user', content: parts.instruction };
+            if (card.slot === 'reference') return parts.reference ? { role: 'user', content: parts.reference } : null;
+            return { role: 'user', content: parts.target };
+        }
+        if (card.enabled === false) return null;
+        const body = String(card.content ?? '');
+        if (!body.trim()) return null;
+        return {
+            role: card.role,
+            content: card.tag ? `<${card.tag}>\n${body}\n</${card.tag}>` : body,
+        };
+    }
+
+    // ⚠️ Adjacent same-role cards merge into ONE message, joined by a blank line. This is
+    // not tidying: two consecutive messages of the same role are refused outright by some
+    // endpoints, and the blank line is what makes the default arrangement reproduce
+    // 0.8.0's bytes exactly (協定 + 編輯原則 in one system message, 指示 + 參考資料 +
+    // 內文 in one user message).
+    function mergePromptMessages(pieces) {
+        const messages = [];
+        for (const piece of pieces) {
+            if (!piece) continue;
+            const last = messages[messages.length - 1];
+            if (last && last.role === piece.role) last.content += `\n\n${piece.content}`;
+            else messages.push({ role: piece.role, content: piece.content });
+        }
+        return messages;
+    }
+
+    // ⚠️ Zero regression: with the factory card arrangement and no reference material this
+    // must produce exactly what 0.3.0 produced, apart from the markers now being
+    // full-width. The reminder line, the extra protocol sentence and the reference block
+    // all appear only when there is reference material to justify them — otherwise this
+    // release would quietly change the behaviour of every existing command.
+    //
+    // core.test.cjs locks that with a hand-typed literal string. The expected value is
+    // deliberately NOT assembled from the MARK constants — otherwise changing a marker
+    // would make the test pass in self-consistent agreement with the bug.
     function buildPrompt(action, scope, role, options = {}) {
         const reference = String(options.referenceBlock ?? '').trim();
-        const globalPrompt = String(options.globalPrompt ?? '');
+        const cards = normalizePromptCards(options.cards);
         const instruction = action.instruction.trim();
         const scopeLabel = scope.hasSelection ? 'a selected passage' : 'the whole message';
         const contextBlocks = scope.hasSelection
@@ -1071,22 +1501,23 @@
                 scope.text,
                 MARK.fullScopeClose,
             ];
-        const userPrompt = [
-            `Task: ${instruction}`,
-            `The editable scope is ${scopeLabel} written by the ${role}.`,
-            '',
-            ...(reference ? [reference, ''] : []),
-            ...contextBlocks,
-            ...(reference ? ['', `Reminder — your task: ${instruction}`] : []),
-        ].join('\n');
-        const protocol = reference && action.mode === 'patch'
-            ? `${LOCKED_PROTOCOL.patch}\n${PATCH_REFERENCE_RULE}`
-            : LOCKED_PROTOCOL[action.mode];
-        const editablePrompt = action.systemPrompt?.trim() || globalPrompt.trim();
-        return [
-            { role: 'system', content: `${protocol}\n\nEditing principles:\n${editablePrompt}` },
-            { role: 'user', content: userPrompt },
-        ];
+        const parts = {
+            protocol: reference && action.mode === 'patch'
+                ? `${LOCKED_PROTOCOL.patch}\n${PATCH_REFERENCE_RULE}`
+                : LOCKED_PROTOCOL[action.mode],
+            instruction: [
+                `Task: ${instruction}`,
+                `The editable scope is ${scopeLabel} written by the ${role}.`,
+            ].join('\n'),
+            reference,
+            // The reminder rides on the pinned last card rather than being a card of its
+            // own. It is a restatement of Task:, and its only reason to exist is that a
+            // long stretch of reference material sits between the two — a draggable card
+            // could be dropped right under 指示, saying the same sentence twice with
+            // nothing in between (ADR-0006).
+            target: contextBlocks.join('\n') + (reference ? `\n\nReminder — your task: ${instruction}` : ''),
+        };
+        return mergePromptMessages(cards.map(card => renderPromptCard(card, parts)));
     }
 
     // ══════ 純函式：更新檢查 ══════
@@ -1111,6 +1542,44 @@
     // is above it, silently wrong the moment that constant is renamed.
     function readVersionFromSource(source) {
         return String(source ?? '').match(/const VERSION = '(\d+\.\d+\.\d+[^']*)'/)?.[1] || '';
+    }
+
+    // The whole new script is already in hand when 檢查更新 runs — fetchUpdateSource
+    // downloads the file and readVersionFromSource picks the number out of it. So the
+    // notes for the version being offered come out of the same download, with no second
+    // request. Reading only the local constant would be backwards: it can only ever
+    // describe the version already installed, which is no help in deciding whether to
+    // update.
+    //
+    // ⚠️ Same trap as readVersionFromSource, and for the same reason: this regex literal
+    // contains the text `const CHANGELOG = ` and is itself part of the source being
+    // searched. The capture must start with a digit so the pattern cannot match its own
+    // spelling and hand back its own regex as the release notes.
+    function readChangelogFromSource(source) {
+        return String(source ?? '').match(/const CHANGELOG = `(\d[\s\S]*?)`;/)?.[1] || '';
+    }
+
+    // A version heading is a bare `x.y.z` on its own line; everything under it belongs to
+    // that release. Anything before the first heading is discarded rather than guessed at.
+    function parseChangelog(text) {
+        const entries = [];
+        for (const line of String(text ?? '').split('\n')) {
+            const heading = line.match(/^(\d+\.\d+\.\d+[^\s]*)\s*$/);
+            if (heading) {
+                entries.push({ version: heading[1], notes: [] });
+                continue;
+            }
+            const note = line.replace(/^-\s*/, '').trim();
+            if (note && entries.length) entries[entries.length - 1].notes.push(note);
+        }
+        return entries;
+    }
+
+    // Everything newer than what is installed, newest first. An empty result after a
+    // successful check means the notes could not be read, not that nothing changed —
+    // the caller says so rather than showing an empty box.
+    function changelogSince(text, currentVersion) {
+        return parseChangelog(text).filter(entry => compareVersions(entry.version, currentVersion) > 0);
     }
 
     // Everything that is checked before a byte of downloaded code is allowed near the
@@ -1168,10 +1637,33 @@
         filterWorldbookEntries,
         buildReferenceBlock,
         buildPrompt,
+        renderPromptCard,
+        mergePromptMessages,
+        normalizePromptCard,
+        normalizePromptCards,
+        defaultPromptCards,
+        sanitizePromptTag,
+        isPinnedCard,
+        resolvePromptCards,
+        migrateGlobalPromptToCards,
+        migrateSystemPromptToCards,
+        normalizeApiConfig,
+        normalizeApiConfigs,
+        resolveApiConfig,
+        endpointChatUrl,
+        endpointModelsUrl,
+        extractModelIds,
+        extractNonStreamContent,
+        describeRequestError,
         compareVersions,
         readVersionFromSource,
+        readChangelogFromSource,
+        BACKEND_SWITCH_LABEL,
+        parseChangelog,
+        changelogSince,
         inspectUpdateSource,
         MARK,
+        CHANGELOG,
     };
 
     if (globalScope.__STIAE_TEST__) {
@@ -1209,7 +1701,7 @@
         cleanup: [],
         // latest is what the last check saw; it is also restored from settings on
         // startup so the notice survives a page reload without asking GitHub again.
-        update: { checking: false, installing: false, checked: false, latest: '', error: '' },
+        update: { checking: false, installing: false, checked: false, latest: '', error: '', changelog: '' },
         // Set while the settings dialog is open so a check that finishes can redraw its
         // own section. Null the rest of the time — this feature must not keep the dialog
         // alive after it closes.
@@ -1265,36 +1757,28 @@
         return globalScope.SillyTavern?.getContext?.() || hostWindow.SillyTavern?.getContext?.();
     }
 
-    function getProfiles() {
-        try {
-            const context = getContext();
-            const service = context?.ConnectionManagerRequestService;
-            if (!service) return [];
-            return service.getSupportedProfiles().slice().sort((a, b) => a.name.localeCompare(b.name));
-        } catch (error) {
-            console.warn('[ST Inline AI Editor] Could not list Connection Profiles.', error);
-            return [];
-        }
-    }
-
-    function addProfileOptions(select, selectedId, includeInherit = false) {
+    // ⚠️ A stored id that no longer names anything gets its own visible option rather
+    // than resetting the select to blank. Blank means 用預設那組, which is a real answer
+    // — quietly turning "the group I chose is gone" into "use the default one" swaps the
+    // model out from under the command with nothing on screen to show for it.
+    function addApiConfigOptions(select, selectedId, includeInherit = false) {
         select.replaceChildren();
-        const profiles = getProfiles();
-        const empty = createElement('option', '', includeInherit ? '沿用全域設定' : '請選擇 Connection Profile');
+        const configs = state.settings.apiConfigs;
+        const empty = createElement('option', '', includeInherit ? '用預設的那一組' : '請選擇一組 API 設定');
         empty.value = '';
         select.append(empty);
-        for (const profile of profiles) {
-            const option = createElement('option', '', profile.name);
-            option.value = profile.id;
+        for (const config of configs) {
+            const option = createElement('option', '', config.name);
+            option.value = config.id;
             select.append(option);
         }
-        if (selectedId && !profiles.some(profile => profile.id === selectedId)) {
-            const missing = createElement('option', '', `⚠ 已遺失的 Profile (${selectedId})`);
+        if (selectedId && !configs.some(config => config.id === selectedId)) {
+            const missing = createElement('option', '', '⚠ 這組 API 設定已被刪除');
             missing.value = selectedId;
             select.append(missing);
         }
         select.value = selectedId || '';
-        return profiles;
+        return configs;
     }
 
     // ══════ 樣式表 ══════
@@ -1490,7 +1974,19 @@
                the section above. That rule is why there is no separate divider element —
                having both produced two lines with a gap between them. */
             .stiae-field-label { margin: 30px 0 12px; padding-top: 20px; border-top: 1px solid var(--stiae-border); color: var(--stiae-fg); font-size: 1.12em; font-weight: 700; }
-            .stiae-settings-body > .stiae-field-label:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+            .stiae-tabpane > .stiae-field-label:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+            /* ⚠️ Tabs rather than folding sections. Two panes are drag-to-reorder lists,
+               and a fold above one of them moves every landing spot mid-drag — a failure
+               this project has already shipped once. Tabs also keep the one-scrolling-
+               area rule: only one pane is in the flow at a time, so .stiae-settings-body
+               stays the single scroller. */
+            .stiae-tabbar { display: flex; gap: 6px; padding: 10px 14px 0; border-bottom: 1px solid var(--stiae-border); overflow-x: auto; flex: 0 0 auto; }
+            .stiae-tabbar .stiae-button { white-space: nowrap; }
+            .stiae-changelog { margin-top: 6px; }
+            .stiae-changelog-version { margin: 14px 0 4px; color: var(--stiae-fg); font-weight: 700; }
+            .stiae-changelog-notes { margin: 0; padding-left: 20px; color: var(--stiae-muted); font-size: .88em; line-height: 1.55; }
+            .stiae-changelog-notes li { margin: 3px 0; }
+            .stiae-warn { color: #ffb0b0; }
             /* Counts and other asides that ride along with a heading without competing. */
             .stiae-label-note { margin-left: 9px; color: var(--stiae-muted); font-size: .8em; font-weight: 400; }
             .stiae-button-row { margin: 12px 0 9px; }
@@ -1531,6 +2027,30 @@
                three columns and the buttons end up in the middle. */
             .stiae-command-row { display: grid; grid-template-columns: auto auto minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--stiae-border); border-radius: 7px; }
             .stiae-command-row-plain { grid-template-columns: auto minmax(0,1fr) auto; }
+            /* Prompt cards come in three tiers of "may I touch this", and until they were
+               told apart by colour the only way to find out was to read every row.
+               The signal is a bar down the left edge, read as: theme colour = yours,
+               grey = the tool's, grey on a filled row = nailed down.
+
+               ⚠️ All three are set once when the row is built and never toggled during a
+               drag, so the 3px border cannot shift the layout out from under the pointer
+               (see .stiae-loose-zone for why that matters). Everything here is derived
+               from the theme's own variables — a hardcoded palette fights whichever
+               SillyTavern theme the user picked. */
+            /* ⚠️ Two signals, not one: the bar's colour AND how filled the row is. The bar
+               alone is not enough — --stiae-accent is whatever the user's theme sets as
+               its quote colour, and on a desaturated theme it lands close enough to
+               --stiae-muted that 使用者卡 and 系統卡 stop being telling apart. The
+               background makes a ramp that survives any accent: empty → faint → filled. */
+            .stiae-card-user { border-left: 3px solid var(--stiae-accent); }
+            .stiae-card-user > i { color: var(--stiae-accent); }
+            .stiae-card-system { border-left: 3px solid var(--stiae-muted); background: rgba(127,127,127,.07); }
+            .stiae-card-system > i { color: var(--stiae-muted); }
+            .stiae-card-locked { border-left: 3px solid var(--stiae-border); background: rgba(127,127,127,.18); }
+            .stiae-card-locked > i, .stiae-card-locked strong { color: var(--stiae-muted); }
+            /* A switched-off card is still yours — it keeps its colour and loses its
+               presence, so "off" never reads as "locked". */
+            .stiae-card-off { opacity: .5; }
             /* Reordering is by dragging on desktop and by arrows on touch — never both at
                once, because two ways to do the same thing in one row is just clutter. */
             .stiae-move-button { display: none !important; }
@@ -2989,7 +3509,7 @@
     // patch-specific reference rule appears for one of them only. Picking one and
     // calling it "the request" would show a protocol the user is not going to send.
     //
-    // What this deliberately cannot show: a command carrying its own 編輯原則覆寫 sends
+    // What this deliberately cannot show: a command that froze its own card list sends
     // that instead of the global principles. The note under the buttons says so, because
     // a preview that quietly differs from the request is worse than no preview.
     //
@@ -3018,7 +3538,7 @@
         const modeHelp = createElement(
             'div',
             'stiae-help',
-            '指示的位置不論哪個指令都一樣，所以用佔位符代表。但兩種模式的輸出協定完全不同，要看哪一種請自己切。指令若有自己的「編輯原則覆寫」，實際送出的會是那一段，不是這裡顯示的全域編輯原則。',
+            '不論按哪個指令，你的要求都會落在同一個位置，所以這裡先用一段假的代替。但「局部修補」和「全文改寫」教 AI 回話的方式完全不同，想看哪一種請自己切。如果某條指令有自己專屬的提示詞模組，它實際送出的會是那一份，不是這裡顯示的。',
         );
         const summary = createElement('div', 'stiae-help');
         const content = createElement('div', 'stiae-preview-rows');
@@ -3039,16 +3559,17 @@
             const mode = session.previewMode === 'replacement' ? 'replacement' : 'patch';
             patchTab.classList.toggle('stiae-tab-on', mode === 'patch');
             rewriteTab.classList.toggle('stiae-tab-on', mode === 'replacement');
-            // A stand-in for a real command: the placeholder instruction, the chosen mode,
-            // and no systemPrompt so buildPrompt falls through to the global principles.
-            const action = { instruction: PREVIEW_INSTRUCTION, mode, systemPrompt: '' };
+            // A stand-in for a real command: the placeholder instruction and the chosen
+            // mode. The card list is the global one, so a command that has frozen its own
+            // list will send something else — the note under the two buttons says so.
+            const action = { instruction: PREVIEW_INSTRUCTION, mode };
             const scope = scopeFromTextarea(session.textarea);
             summary.textContent = '正在組裝…';
             const reference = await refreshReference(session);
             if (state.activeRequestPreview !== overlay) return;
             const messages = buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
-                globalPrompt: state.settings.globalPrompt,
+                cards: state.settings.promptCards,
             });
             const size = messages.reduce((total, message) => total + message.content.length, 0);
             summary.textContent = [
@@ -3058,11 +3579,14 @@
             plain = messages.map(message => `${message.role}:\n${message.content}`).join('\n\n');
             content.replaceChildren();
             for (const message of messages) {
-                content.append(createElement('div', 'stiae-request-role', message.role === 'system'
-                    ? '系統訊息（協定與編輯原則）'
-                    : '使用者訊息（指示與內容）'));
+                content.append(createElement('div', 'stiae-request-role', MESSAGE_ROLE_LABELS[message.role] || message.role));
                 content.append(createElement('pre', 'stiae-preview-pre', message.content));
             }
+            // No "the last message must be a user turn" check here, and none is needed:
+            // 目標內文 is pinned last and always produces text, so the merged list always
+            // ends on a user message no matter how the free stretch is arranged. That is
+            // a second thing the pinning buys, on top of keeping reference material ahead
+            // of the prose being edited.
         };
 
         const dismiss = () => {
@@ -3470,19 +3994,217 @@
         textarea.focus();
     }
 
-    function resolveProfile(action) {
-        const profileId = action.profileId || state.settings.defaultProfileId;
-        const expectedProfileName = action.profileId ? action.profileName : state.settings.defaultProfileName;
-        if (!profileId) throw new Error('尚未選擇 AI 內文編輯器的 Connection Profile。');
-        const context = getContext();
-        const service = context?.ConnectionManagerRequestService;
-        if (!service) throw new Error('目前 SillyTavern 未提供 Connection Profile 請求服務。請確認版本至少為 1.18.0。');
-        const profile = service.getProfile(profileId);
-        service.validateProfile(profile);
-        if (expectedProfileName && profile.name !== expectedProfileName) {
-            throw new Error(`Connection Profile「${expectedProfileName}」已被重新命名。請在設定中重新選擇。`);
+    // ══════ API 請求：直連與代發 ══════
+
+    const REQUEST_TIMEOUT_MS = 300000;
+
+    // Every message this can throw names the thing the user has to go and do. "尚未設定
+    // API" with no more than that is the version 0.8.0 shipped for a missing profile, and
+    // it left people hunting through SillyTavern's own settings for a switch that was
+    // never there.
+    function requireApiConfig(action) {
+        const config = resolveApiConfig(state.settings, action);
+        if (!config) throw new Error('還沒有可用的 API 設定。請到設定的「API 設定」分頁新增一組，填入網址、金鑰與模型。');
+        if (!config.endpoint) throw new Error(`API 設定「${config.name}」還沒填網址。`);
+        if (!config.apiKey) throw new Error(`API 設定「${config.name}」還沒填 API 金鑰。設定代碼為了安全不含金鑰，換版本之後要再貼一次。`);
+        if (!config.model) throw new Error(`API 設定「${config.name}」還沒填模型。可以按「載入模型」挑一個，或直接打上去。`);
+        return config;
+    }
+
+    function requestBody(config, messages, stream) {
+        const body = {
+            model: config.model,
+            messages,
+            max_tokens: config.maxTokens,
+            stream: Boolean(stream),
+        };
+        // Blank temperature means the parameter is left out entirely — some models
+        // refuse the request outright when it is present.
+        if (config.temperature !== null) body.temperature = config.temperature;
+        return body;
+    }
+
+    function directHeaders(config) {
+        return { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` };
+    }
+
+    async function readResponseError(response) {
+        const detail = await response.text().catch(() => '');
+        const error = new Error(detail.slice(0, 300));
+        error.status = response.status;
+        return error;
+    }
+
+    // The backend-forward path: SillyTavern's own server makes the call, so the browser
+    // never talks to the third party and CORS cannot apply. Same endpoint, same key —
+    // this is not a Connection Profile and does not touch the user's active connection.
+    //
+    // ⚠️ ST's backend appends /chat/completions to custom_url itself, so the suffix is
+    // stripped here. Getting that wrong sends the request somewhere the user never typed.
+    function backendPayload(config, messages, stream) {
+        const url = endpointChatUrl(config.endpoint).replace(/\/chat\/completions$/, '');
+        const { model, messages: body, max_tokens: maxTokens, ...rest } = requestBody(config, messages, stream);
+        delete rest.stream;
+        return {
+            chat_completion_source: 'custom',
+            custom_url: url,
+            // Must be a string: the backend runs it through a YAML parse, and JSON is
+            // valid YAML.
+            custom_include_headers: JSON.stringify({ Authorization: `Bearer ${config.apiKey}` }),
+            model,
+            messages: body,
+            max_tokens: maxTokens,
+            stream: Boolean(stream),
+            ...rest,
+        };
+    }
+
+    function backendService() {
+        const service = getContext()?.ChatCompletionService;
+        if (typeof service?.processRequest !== 'function') {
+            throw new Error(`你的 SillyTavern 版本沒有這個轉送功能。請把「${BACKEND_SWITCH_LABEL}」取消勾選，或升級 SillyTavern。`);
         }
-        return { profileId, profile, service };
+        return service;
+    }
+
+    async function sendViaBackend(config, messages, signal, onText) {
+        const service = backendService();
+        const stream = config.stream;
+        const result = await service.processRequest(backendPayload(config, messages, stream), { presetName: undefined }, true, signal);
+        if (!stream) return String(result?.content ?? '');
+        const iterator = typeof result === 'function' ? result() : result;
+        let text = '';
+        for await (const chunk of iterator) {
+            // Same contract as ConnectionManagerRequestService: each chunk carries the
+            // whole text so far, not the delta. `=` is not a missing `+=`.
+            text = String(chunk?.text ?? text);
+            onText(text);
+        }
+        return text;
+    }
+
+    async function sendDirect(config, messages, signal, onText) {
+        const response = await hostWindow.fetch(endpointChatUrl(config.endpoint), {
+            method: 'POST',
+            headers: directHeaders(config),
+            body: JSON.stringify(requestBody(config, messages, config.stream)),
+            signal,
+        });
+        if (!response.ok) throw await readResponseError(response);
+        if (!config.stream) {
+            const data = await response.json();
+            return String(data?.choices?.[0]?.message?.content ?? '');
+        }
+        return readEventStream(response, onText);
+    }
+
+    // ⚠️ Some relays answer `stream: true` with an ordinary completion instead of an
+    // event stream. Scanning that for `data:` lines finds nothing, and an empty reply
+    // reads upstream as "the model said nothing" — the whole scope then gets replaced by
+    // a fallback nobody asked for. Whatever was collected is re-read as a plain body
+    // before giving up.
+    async function readEventStream(response, onText) {
+        const reader = response.body?.getReader?.();
+        if (!reader) return extractNonStreamContent(await response.text());
+        const decoder = new hostWindow.TextDecoder();
+        let buffer = '';
+        let raw = '';
+        let text = '';
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const piece = decoder.decode(value, { stream: true });
+            raw += piece;
+            buffer += piece;
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+                const payload = line.replace(/^data:\s*/, '').trim();
+                if (!payload || payload === line.trim() || payload === '[DONE]') continue;
+                try {
+                    const delta = JSON.parse(payload)?.choices?.[0]?.delta?.content;
+                    if (typeof delta === 'string' && delta) {
+                        text += delta;
+                        onText(text);
+                    }
+                } catch {
+                    // A partial or non-JSON event is not fatal; the stream carries on.
+                }
+            }
+        }
+        if (text) return text;
+        const fallback = extractNonStreamContent(raw);
+        if (fallback) onText(fallback);
+        return fallback;
+    }
+
+    async function generateWithApi(request, dialog) {
+        const controller = new hostWindow.AbortController();
+        let stopped = false;
+        dialog.setStopHandler(() => {
+            stopped = true;
+            controller.abort();
+        });
+        const timer = hostWindow.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+            const send = request.config.viaBackend ? sendViaBackend : sendDirect;
+            const text = await send(request.config, request.messages, controller.signal, value => dialog.updateStream(value));
+            return { text, stopped };
+        } catch (error) {
+            if (stopped) return { text: '', stopped: true };
+            // Rethrown with a sentence that says what to do about it. The raw error stays
+            // on the console; a bare "Failed to fetch" in the dialog helps nobody.
+            const described = new Error(describeRequestError(error, request.config.viaBackend));
+            described.cause = error;
+            throw described;
+        } finally {
+            hostWindow.clearTimeout(timer);
+        }
+    }
+
+    // Asks the provider what it can run. It doubles as the only connection test there
+    // is, but ⚠️ it is a thermometer, not a lock: /models and /chat/completions are two
+    // different addresses whose permissions can differ, so a failure here never stops
+    // the user saving the group or typing a model name by hand (ADR-0005).
+    async function fetchApiModels(config) {
+        const controller = new hostWindow.AbortController();
+        const timer = hostWindow.setTimeout(() => controller.abort(), 20000);
+        try {
+            // Must travel the same road as a real request. A models call that always went
+            // direct would report failure on a connection that works, because the switch
+            // that fixes it was never applied here.
+            if (config.viaBackend) {
+                const service = getContext();
+                if (typeof service?.getRequestHeaders !== 'function') {
+                    throw new Error('你的 SillyTavern 版本沒辦法幫忙轉送模型清單的請求。模型名稱請自己打上去。');
+                }
+                const response = await hostWindow.fetch('/api/backends/chat-completions/status', {
+                    method: 'POST',
+                    headers: service.getRequestHeaders(),
+                    body: JSON.stringify({
+                        chat_completion_source: 'custom',
+                        custom_url: endpointModelsUrl(config.endpoint).replace(/\/models$/, ''),
+                        custom_include_headers: JSON.stringify({ Authorization: `Bearer ${config.apiKey}` }),
+                    }),
+                    signal: controller.signal,
+                });
+                if (!response.ok) throw await readResponseError(response);
+                const data = await response.json();
+                // ⚠️ This route does not fail with a status code: an upstream error comes
+                // back as 200 with { error: true }.
+                if (data?.error) throw new Error('酒館的伺服器送不出去。請核對網址與金鑰；詳細原因會出現在酒館伺服器的主控台。');
+                return extractModelIds(data);
+            }
+            const response = await hostWindow.fetch(endpointModelsUrl(config.endpoint), {
+                method: 'GET',
+                headers: directHeaders(config),
+                signal: controller.signal,
+            });
+            if (!response.ok) throw await readResponseError(response);
+            return extractModelIds(await response.json());
+        } finally {
+            hostWindow.clearTimeout(timer);
+        }
     }
 
     // ══════ 差異視窗與審核流程 ══════
@@ -3614,7 +4336,7 @@
         const details = createElement('details', 'stiae-request-preview');
         details.append(createElement('summary', '', `查看這次送出的完整請求（${size.toLocaleString('en-US')} 字元）`));
         for (const message of rows) {
-            details.append(createElement('div', 'stiae-request-role', message.role === 'system' ? '系統訊息（協定與編輯原則）' : '使用者訊息（指示與內容）'));
+            details.append(createElement('div', 'stiae-request-role', MESSAGE_ROLE_LABELS[message.role] || message.role));
             details.append(createElement('pre', 'stiae-request-body', String(message?.content ?? '')));
         }
         return details;
@@ -3801,46 +4523,13 @@
         return api;
     }
 
-    async function generateWithProfile(request, dialog) {
-        const abortController = new hostWindow.AbortController();
-        let stopped = false;
-        dialog.setStopHandler(() => {
-            stopped = true;
-            abortController.abort();
-        });
-        const streamResponse = await request.service.sendRequest(
-            request.profileId,
-            request.messages,
-            request.maxTokens,
-            {
-                extractData: true,
-                includePreset: true,
-                stream: true,
-                signal: abortController.signal,
-            },
-        );
-        let finalText = '';
-        if (typeof streamResponse === 'function') {
-            const generator = streamResponse();
-            for await (const chunk of generator) {
-                finalText = String(chunk?.text ?? finalText);
-                dialog.updateStream(finalText);
-            }
-        } else {
-            finalText = String(streamResponse?.content ?? '');
-            dialog.updateStream(finalText);
-        }
-        return { text: finalText, stopped };
-    }
-
     async function runAiAction(session, actionInput) {
         if (!session || state.activeEditor !== session || state.activeReview) return;
         closeDetailsMenus(session.toolbar);
         const action = {
             ...actionInput,
             mode: actionInput.mode === 'replacement' ? 'replacement' : 'patch',
-            systemPrompt: actionInput.systemPrompt || '',
-            profileId: actionInput.profileId || '',
+            apiConfigId: actionInput.apiConfigId || '',
         };
         const scope = scopeFromTextarea(session.textarea);
         if (!scope.text.length) {
@@ -3848,12 +4537,12 @@
             return;
         }
 
-        let connection;
+        let config;
         try {
-            connection = resolveProfile(action);
+            config = requireApiConfig(action);
         } catch (error) {
-            toast('error', error.message || 'Connection Profile 無法使用，請重新選擇。');
-            openSettings(true);
+            toast('error', error.message);
+            openSettings('api');
             return;
         }
 
@@ -3864,12 +4553,11 @@
         if (state.activeEditor !== session || state.activeReview) return;
 
         const request = {
-            ...connection,
+            config,
             messages: buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
-                globalPrompt: state.settings.globalPrompt,
+                cards: resolvePromptCards(state.settings, actionInput),
             }),
-            maxTokens: action.maxTokens || state.settings.defaultMaxTokens,
         };
         const dialog = createReviewDialog(action, scope, request.messages);
 
@@ -3877,14 +4565,20 @@
             dialog.showGenerating();
             let response;
             try {
-                response = await generateWithProfile(request, dialog);
+                response = await generateWithApi(request, dialog);
             } catch (error) {
                 const stopped = error?.name === 'AbortError' || error?.cause?.name === 'AbortError';
                 // The dialog only has room for the short message, and a bare status code
                 // says nothing about why the provider refused. Keep the whole error where
                 // it can be read.
                 if (!stopped) console.error('[ST Inline AI Editor] Generation failed.', error, error?.cause);
-                dialog.showError(stopped ? '請重新生成或關閉視窗。' : (error?.cause?.message || error?.message || 'API 請求失敗。'), stopped);
+                // ⚠️ `error.message` first, `cause` only as a fallback. generateWithApi
+                // has already turned the raw failure into a sentence that says what to do
+                // about it, and the original is kept on `cause` for the console. Reading
+                // cause first — which is what 0.8.0 did, because the profile service
+                // wrapped errors the other way round — puts a bare "Failed to fetch" on
+                // screen and buries the one line telling the user to tick 代發.
+                dialog.showError(stopped ? '請重新生成或關閉視窗。' : (error?.message || error?.cause?.message || 'API 請求失敗。'), stopped);
                 const decision = await dialog.waitAction();
                 if (decision === 'regenerate') continue;
                 dialog.close();
@@ -4015,6 +4709,11 @@
             if (!inspected.ok) throw new Error(inspected.error);
             state.update.latest = inspected.version;
             state.update.checked = true;
+            // Lifted from the copy just downloaded, so the notes on screen describe the
+            // version being offered rather than the one already installed. Deliberately
+            // not persisted: it belongs to a version that is not running here, and a
+            // stale copy of it after an update would describe changes already applied.
+            state.update.changelog = readChangelogFromSource(source);
             state.settings.updateLatestVersion = inspected.version;
             saveSettings();
             toast(inspected.newer ? 'success' : 'info', inspected.newer
@@ -4091,7 +4790,7 @@
             : '';
         const confirmed = await showConfirm(
             `要把這支腳本從 ${VERSION} 換成 ${version} 嗎？\n\n`
-            + '換的是腳本庫裡這一支的內容，不是新增一份，所以你的設定全部留著：Connection Profile、編輯原則、內建指令的修改、客製指令與分組、世界書勾選。\n\n'
+            + '換的是腳本庫裡這一支的內容，不是新增一份，所以你的設定全部留著：API 設定（含金鑰）、提示詞模組、內建指令的修改、客製指令與分組、世界書勾選。\n\n'
             + '換完之後酒館助手會自己重新載入這個腳本，開著的編輯器與設定視窗會關閉。'
             + unsaved,
             { confirmLabel: `更新到 ${version}`, danger: Boolean(unsaved) },
@@ -4232,6 +4931,359 @@
         return select.value;
     }
 
+    async function showApiConfigForm(existing) {
+        const config = existing ? clone(existing) : normalizeApiConfig({ name: '' }, state.settings.apiConfigs.length);
+        return showSimpleForm(existing ? '編輯 API 設定' : '新增 API 設定', form => {
+            const nameField = createElement('div', 'stiae-field');
+            nameField.append(createElement('label', '', '名稱'));
+            const name = createElement('input');
+            name.name = 'name';
+            name.required = true;
+            name.value = existing ? config.name : '';
+            name.placeholder = '例如：OpenRouter 主力';
+            nameField.append(name);
+
+            const endpointField = createElement('div', 'stiae-field');
+            endpointField.append(createElement('label', '', 'API 網址'));
+            const endpoint = createElement('input');
+            endpoint.name = 'endpoint';
+            endpoint.required = true;
+            endpoint.value = config.endpoint;
+            endpoint.placeholder = 'https://openrouter.ai/api/v1';
+            endpointField.append(endpoint, createElement(
+                'div',
+                'stiae-help',
+                'AI 服務商給你的網址，通常長得像 https://openrouter.ai/api/v1。⚠ 這裡填什麼就用什麼，工具不會幫你猜、也不會自動補東西——請照服務商文件上寫的完整複製過來（多數要以 /v1 結尾）。',
+            ));
+
+            const keyField = createElement('div', 'stiae-field');
+            keyField.append(createElement('label', '', 'API 金鑰'));
+            const apiKey = createElement('input');
+            apiKey.name = 'apiKey';
+            apiKey.type = 'password';
+            apiKey.value = config.apiKey;
+            apiKey.placeholder = 'sk-…';
+            keyField.append(apiKey, createElement(
+                'div',
+                'stiae-help',
+                '服務商給你的那串密碼，通常以 sk- 開頭。⚠ 為了安全，它不會被放進「複製設定代碼」裡——換版本或換電腦之後要再貼一次。',
+            ));
+
+            const modelField = createElement('div', 'stiae-field');
+            modelField.append(createElement('label', '', '模型'));
+            const model = createElement('input');
+            model.name = 'model';
+            model.required = true;
+            model.value = config.model;
+            model.placeholder = 'openai/gpt-4o-mini';
+            const modelList = createElement('select');
+            modelList.classList.add('stiae-hidden');
+            const loadModels = button('載入模型', 'fa-cloud-arrow-down');
+            const modelHint = createElement('div', 'stiae-help');
+            modelField.append(model, createElement('div', 'stiae-help', '要用哪一個模型。按「載入模型」可以直接跟服務商要一份清單來挑，也可以自己打。'), loadModels, modelList, modelHint);
+            modelList.addEventListener('change', () => {
+                if (modelList.value) model.value = modelList.value;
+            });
+            // ⚠️ A thermometer, not a lock. /models and /chat/completions are two different
+            // addresses whose permissions can differ, so this never blocks saving and the
+            // model name stays typeable — some relays serve chat and nothing else.
+            loadModels.addEventListener('click', async () => {
+                const probe = normalizeApiConfig({
+                    ...config,
+                    endpoint: endpoint.value,
+                    apiKey: apiKey.value,
+                    viaBackend: viaBackend.checked,
+                });
+                if (!probe.endpoint) {
+                    modelHint.textContent = '請先把上面的網址填好。';
+                    return;
+                }
+                modelHint.textContent = '正在問服務商…';
+                modelList.classList.add('stiae-hidden');
+                try {
+                    const ids = await fetchApiModels(probe);
+                    if (!ids.length) {
+                        modelHint.textContent = '這個服務商沒有回傳任何模型清單。沒關係，模型名稱直接打上去就行。';
+                        return;
+                    }
+                    modelList.replaceChildren();
+                    const placeholder = createElement('option', '', `— 挑一個（共 ${ids.length} 個）—`);
+                    placeholder.value = '';
+                    modelList.append(placeholder);
+                    for (const id of ids) {
+                        const option = createElement('option', '', id);
+                        option.value = id;
+                        modelList.append(option);
+                    }
+                    if (model.value && ids.includes(model.value)) modelList.value = model.value;
+                    modelList.classList.remove('stiae-hidden');
+                    modelHint.textContent = `共 ${ids.length} 個模型，挑一個就會自動填進上面。也可以繼續自己打。`;
+                } catch (error) {
+                    console.error('[ST Inline AI Editor] Model list failed.', error);
+                    modelHint.textContent = `${describeRequestError(error, probe.viaBackend)}\n（拿不到清單不代表不能用——模型名稱自己打上去一樣可以存。）`;
+                }
+            });
+
+            const row = createElement('div', 'stiae-inline-fields');
+            const tempField = createElement('div', 'stiae-field');
+            tempField.append(createElement('label', '', '溫度'));
+            const temperature = createElement('input');
+            temperature.name = 'temperature';
+            temperature.type = 'number';
+            temperature.step = '0.05';
+            temperature.min = '0';
+            temperature.max = '2';
+            temperature.placeholder = '留空＝不送出';
+            temperature.value = config.temperature === null ? '' : String(config.temperature);
+            tempField.append(temperature, createElement('div', 'stiae-help', 'AI 的自由度：低（0.3）比較穩、照著你說的做；高（1.0）比較有變化。⚠ 不確定就留空——留空代表完全不動這個設定，交給服務商的預設值。有些新型的推理模型只要收到這個數字就會直接拒絕。'));
+            const tokensField = createElement('div', 'stiae-field');
+            tokensField.append(createElement('label', '', '最大回覆長度'));
+            const maxTokens = createElement('input');
+            maxTokens.name = 'maxTokens';
+            maxTokens.type = 'number';
+            maxTokens.min = '64';
+            maxTokens.step = '1';
+            maxTokens.value = String(config.maxTokens);
+            tokensField.append(maxTokens, createElement('div', 'stiae-help', 'AI 這次最多能回多少字（單位是 token，中文一個字大約算 1～2 個）。設太小會讓長回覆被切斷。'));
+            row.append(tempField, tokensField);
+
+            const backendLabel = createElement('label', 'stiae-checkbox');
+            const viaBackend = createElement('input');
+            viaBackend.name = 'viaBackend';
+            viaBackend.type = 'checkbox';
+            viaBackend.checked = config.viaBackend;
+            backendLabel.append(viaBackend, createElement('span', '', BACKEND_SWITCH_LABEL));
+
+            const streamLabel = createElement('label', 'stiae-checkbox');
+            const stream = createElement('input');
+            stream.name = 'stream';
+            stream.type = 'checkbox';
+            stream.checked = config.stream;
+            streamLabel.append(stream, createElement('span', '', '一邊生成一邊顯示'));
+
+            form.append(
+                nameField,
+                endpointField,
+                keyField,
+                modelField,
+                row,
+                backendLabel,
+                createElement('div', 'stiae-help', '按下指令卻說「連不上」的時候，勾這個。有些服務商不允許網頁直接連它（這是瀏覽器的安全限制，不是你設定錯）；勾了之後改由 SillyTavern 自己的伺服器去送同一個請求，用的還是上面那組網址與金鑰。「載入模型」也會跟著改走這條路。'),
+                streamLabel,
+                createElement('div', 'stiae-help', '關掉的話，會等 AI 整段寫完才一次跳出來。'),
+            );
+            hostWindow.setTimeout(() => name.focus(), 0);
+        }, form => {
+            const name = form.elements.name.value.trim();
+            const endpoint = form.elements.endpoint.value.trim();
+            if (!name || !endpoint) return undefined;
+            return normalizeApiConfig({
+                ...config,
+                name,
+                endpoint,
+                apiKey: form.elements.apiKey.value.trim(),
+                model: form.elements.model.value.trim(),
+                temperature: form.elements.temperature.value.trim(),
+                maxTokens: form.elements.maxTokens.value,
+                viaBackend: form.elements.viaBackend.checked,
+                stream: form.elements.stream.checked,
+            }, 0);
+        });
+    }
+
+    function promptCardTitle(card) {
+        if (card.kind === 'protocol') return '輸出協定';
+        if (card.kind === 'system') return SYSTEM_CARD_SLOTS[card.slot].name;
+        return card.name;
+    }
+
+    function promptCardMeta(card) {
+        if (card.kind === 'protocol') return '鎖定 · 永遠在最前面 · 這段在教 AI 用什麼格式回話，改掉或關掉工具就完全不能用';
+        if (card.kind === 'system') {
+            const pinned = card.slot === PINNED_LAST ? '鎖定 · 永遠在最後面' : '工具自動填 · 可以調位置';
+            return `${pinned} · ${SYSTEM_CARD_SLOTS[card.slot].help}`;
+        }
+        const marks = [MESSAGE_ROLE_LABELS[card.role]];
+        if (card.tag) marks.push(`包在 <${card.tag}> 裡`);
+        if (!card.enabled) marks.push('已關閉，這次不送');
+        return marks.join(' · ');
+    }
+
+    async function showPromptCardForm(existing) {
+        const card = existing ? clone(existing) : normalizePromptCard({ kind: 'user', name: '', content: '' });
+        return showSimpleForm(existing ? '編輯模組' : '新增模組', form => {
+            const nameField = createElement('div', 'stiae-field');
+            nameField.append(createElement('label', '', '名稱'));
+            const name = createElement('input');
+            name.name = 'name';
+            name.required = true;
+            name.value = existing ? card.name : '';
+            name.placeholder = '例如：對白口語化';
+            nameField.append(name);
+
+            const row = createElement('div', 'stiae-inline-fields');
+            const roleField = createElement('div', 'stiae-field');
+            roleField.append(createElement('label', '', '身分'));
+            const role = createElement('select');
+            role.name = 'role';
+            for (const [value, label] of Object.entries(MESSAGE_ROLE_LABELS)) {
+                const option = createElement('option', '', label);
+                option.value = value;
+                role.append(option);
+            }
+            role.value = card.role;
+            roleField.append(role, createElement('div', 'stiae-help', '不確定就選「系統訊息」——那是講給 AI 聽的做事準則，多數自訂內容都屬於這一類。上下相鄰、身分相同的模組會自動併成同一則送出去。'));
+
+            const tagField = createElement('div', 'stiae-field');
+            tagField.append(createElement('label', '', '標籤（選填）'));
+            const tag = createElement('input');
+            tag.name = 'tag';
+            tag.value = card.tag;
+            tag.placeholder = 'style_guide';
+            tagField.append(tag, createElement('div', 'stiae-help', '幫這段內容取個名字包起來，AI 比較容易看出它是獨立的一塊。例如填 style_guide，送出去就會變成「<style_guide> 你的內容 </style_guide>」。不知道要填什麼就留空，不影響使用。（search、replace 這兩個名字不能用，工具內部在用。）'));
+            row.append(roleField, tagField);
+
+            const contentField = createElement('div', 'stiae-field');
+            contentField.append(createElement('label', '', '內容'));
+            const content = createElement('textarea');
+            content.name = 'content';
+            content.required = true;
+            content.value = card.content;
+            contentField.append(content);
+
+            form.append(nameField, row, contentField);
+            hostWindow.setTimeout(() => name.focus(), 0);
+        }, form => {
+            const name = form.elements.name.value.trim();
+            const content = form.elements.content.value;
+            if (!name || !content.trim()) return undefined;
+            const wanted = form.elements.tag.value.trim();
+            const tag = sanitizePromptTag(wanted);
+            if (wanted && !tag) toast('warning', `標籤「${wanted}」不能用，已改成不加標籤。`);
+            return normalizePromptCard({ ...card, name, content, role: form.elements.role.value, tag });
+        });
+    }
+
+    // Draws the card list and hands back a fresh array on every change. Used inline by
+    // the 提示詞設定 tab and inside a dialog by the command form, so both views of the
+    // same idea are literally the same code.
+    //
+    // ⚠️ The drop indicator only ever changes colour — it always occupies its space. An
+    // indicator that appears on dragstart pushes the list open under the pointer and
+    // every landing spot moves, which makes dragging useless while every automated test
+    // still passes (synthetic DragEvents never lay anything out).
+    function renderPromptCardList(container, cards, onChange) {
+        let dragFrom = null;
+        const draw = () => {
+            container.replaceChildren();
+            cards.forEach((card, index) => {
+                const pinned = isPinnedCard(card);
+                // Three tiers, three looks. Which cards you may touch is the first thing
+                // you need off this list, and the wording alone made every row look the
+                // same until you actually read it.
+                const tier = pinned ? 'stiae-card-locked' : (card.kind === 'system' ? 'stiae-card-system' : 'stiae-card-user');
+                const off = card.kind === 'user' && !card.enabled ? ' stiae-card-off' : '';
+                const row = createElement('div', `stiae-command-row ${tier}${pinned ? ' stiae-command-row-plain' : ''}${off}`);
+                if (!pinned) {
+                    const grip = createElement('div', 'stiae-drag-grip');
+                    grip.append(createElement('i', 'fa-solid fa-grip-vertical'));
+                    row.append(grip);
+                    row.draggable = true;
+                }
+                const icon = createElement('i', `fa-solid ${pinned ? 'fa-lock' : (card.kind === 'system' ? 'fa-gear' : 'fa-note-sticky')}`);
+                const label = createElement('div');
+                label.append(createElement('strong', '', promptCardTitle(card)), createElement('div', 'stiae-help', promptCardMeta(card)));
+                const actions = createElement('div', 'stiae-command-row-actions');
+                if (card.kind === 'user') {
+                    const toggle = button('', card.enabled ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
+                    toggle.title = card.enabled ? '這次不要送出這張' : '重新啟用';
+                    toggle.addEventListener('click', () => {
+                        cards[index] = { ...card, enabled: !card.enabled };
+                        onChange(cards);
+                        draw();
+                    });
+                    const edit = button('', 'fa-pen', 'stiae-icon-button');
+                    edit.title = '編輯';
+                    edit.addEventListener('click', async () => {
+                        const updated = await showPromptCardForm(card);
+                        if (!updated) return;
+                        cards[index] = updated;
+                        onChange(cards);
+                        draw();
+                    });
+                    const remove = button('', 'fa-trash', 'stiae-icon-button');
+                    remove.title = '刪除';
+                    remove.addEventListener('click', async () => {
+                        if (!await showConfirm(`刪除模組「${card.name}」嗎？`, { confirmLabel: '刪除', danger: true })) return;
+                        cards.splice(index, 1);
+                        onChange(cards);
+                        draw();
+                    });
+                    actions.append(toggle, edit, remove);
+                }
+                if (!pinned) {
+                    const up = button('', 'fa-arrow-up', 'stiae-icon-button stiae-move-button');
+                    up.title = '往上';
+                    up.disabled = index <= 1;
+                    up.addEventListener('click', () => move(index, index - 1));
+                    const down = button('', 'fa-arrow-down', 'stiae-icon-button stiae-move-button');
+                    down.title = '往下';
+                    down.disabled = index >= cards.length - 2;
+                    down.addEventListener('click', () => move(index, index + 1));
+                    actions.append(up, down);
+                }
+                row.append(icon, label, actions);
+
+                if (!pinned) {
+                    row.addEventListener('dragstart', event => {
+                        dragFrom = index;
+                        container.classList.add('stiae-dragging-command');
+                        event.dataTransfer.effectAllowed = 'move';
+                    });
+                    row.addEventListener('dragend', () => {
+                        dragFrom = null;
+                        container.classList.remove('stiae-dragging-command');
+                        draw();
+                    });
+                }
+                // Pinned rows still accept dragover so the row above/below the ends can be
+                // reached, but the landing index is clamped inside the free stretch.
+                row.addEventListener('dragover', event => {
+                    if (dragFrom === null) return;
+                    event.preventDefault();
+                    const rect = row.getBoundingClientRect();
+                    const after = event.clientY > rect.top + rect.height / 2;
+                    row.classList.toggle('stiae-drop-after', after);
+                    row.classList.toggle('stiae-drop-before', !after);
+                });
+                row.addEventListener('dragleave', () => {
+                    row.classList.remove('stiae-drop-before', 'stiae-drop-after');
+                });
+                row.addEventListener('drop', event => {
+                    event.preventDefault();
+                    if (dragFrom === null) return;
+                    const rect = row.getBoundingClientRect();
+                    move(dragFrom, event.clientY > rect.top + rect.height / 2 ? index + 1 : index);
+                });
+                container.append(row);
+            });
+        };
+        // ⚠️ Clamped to the stretch between the two pinned cards. 協定 must stay first and
+        // 目標內文 last — that pair is what makes "reference material after the prose being
+        // edited" impossible to express (ADR-0006).
+        const move = (from, to) => {
+            const target = Math.min(Math.max(to, 1), cards.length - 1);
+            const [moved] = cards.splice(from, 1);
+            cards.splice(target > from ? target - 1 : target, 0, moved);
+            dragFrom = null;
+            container.classList.remove('stiae-dragging-command');
+            onChange(cards);
+            draw();
+        };
+        draw();
+        return draw;
+    }
+
     async function showCommandForm(existing, isBuiltin = false, groupNames = []) {
         const command = existing ? clone(existing) : normalizeCommand({ name: '', instruction: '', visible: true }, state.settings.commands.length);
         const title = isBuiltin ? '編輯內建指令' : (existing ? '編輯客製指令' : '新增客製指令');
@@ -4327,32 +5379,46 @@
             instruction.value = command.instruction;
             instructionField.append(instruction);
 
-            const systemField = createElement('div', 'stiae-field');
-            systemField.append(createElement('label', '', '編輯原則覆寫（選填）'));
-            const systemPrompt = createElement('textarea');
-            systemPrompt.name = 'systemPrompt';
-            systemPrompt.value = command.systemPrompt;
-            systemPrompt.placeholder = '留空時沿用全域編輯原則；填了則取代它，不是疊加。輸出協定不受影響。';
-            systemField.append(systemPrompt);
+            // Held in the closure rather than in a form field: it is a list, not a value.
+            // null means 跟隨全域 — the command has no list of its own (ADR-0007).
+            const cardsField = createElement('div', 'stiae-field');
+            cardsField.append(createElement('label', '', '提示詞模組'));
+            const cardsStatus = createElement('div', 'stiae-help');
+            const cardsRow = createElement('div', 'stiae-command-row-actions');
+            const editCards = button('編輯這條指令的模組', 'fa-layer-group');
+            const resetCards = button('改回跟著設定走', 'fa-rotate-left');
+            cardsRow.append(editCards, resetCards);
+            cardsField.append(cardsStatus, cardsRow);
+            const paintCards = () => {
+                const own = Array.isArray(command.promptCards);
+                cardsStatus.textContent = own
+                    ? `專屬的 · 這條指令有自己的 ${command.promptCards.filter(card => card.kind === 'user').length} 個模組，之後改「提示詞設定」不會影響到它`
+                    : '跟著設定走 · 用「提示詞設定」那一份。你第一次動它的時候，才會複製一份專屬的給這條指令';
+                resetCards.disabled = !own;
+            };
+            editCards.addEventListener('click', async () => {
+                // The copy happens here, at the first edit — not when the command is
+                // created. A command nobody has had a reason to change keeps following
+                // the global list, so one edit there reaches all of them.
+                const working = clone(resolvePromptCards(state.settings, command));
+                const changed = await showPromptCardsDialog(`「${name.value.trim() || command.name}」的提示詞模組`, working);
+                if (!changed) return;
+                command.promptCards = changed;
+                paintCards();
+            });
+            resetCards.addEventListener('click', async () => {
+                if (!await showConfirm('改回跟著設定走嗎？這條指令自己那一份模組會被丟掉。', { confirmLabel: '改回去', danger: true })) return;
+                command.promptCards = null;
+                paintCards();
+            });
+            paintCards();
 
-            const advanced = createElement('div', 'stiae-inline-fields');
-            const profileField = createElement('div', 'stiae-field');
-            profileField.append(createElement('label', '', 'Connection Profile 覆寫'));
-            const profile = createElement('select');
-            profile.name = 'profileId';
-            addProfileOptions(profile, command.profileId, true);
-            profileField.append(profile);
-            const tokensField = createElement('div', 'stiae-field');
-            tokensField.append(createElement('label', '', '最大輸出 Tokens（選填）'));
-            const maxTokens = createElement('input');
-            maxTokens.name = 'maxTokens';
-            maxTokens.type = 'number';
-            maxTokens.min = '64';
-            maxTokens.step = '1';
-            maxTokens.placeholder = '沿用全域設定';
-            maxTokens.value = command.maxTokens || '';
-            tokensField.append(maxTokens);
-            advanced.append(profileField, tokensField);
+            const apiField = createElement('div', 'stiae-field');
+            apiField.append(createElement('label', '', '專用的 API 設定（選填）'));
+            const apiConfig = createElement('select');
+            apiConfig.name = 'apiConfigId';
+            addApiConfigOptions(apiConfig, command.apiConfigId, true);
+            apiField.append(apiConfig, createElement('div', 'stiae-help', '這條指令要用哪一組 AI 連線。選了就是整組換掉——網址、金鑰、模型、溫度、長度一起換。留空就跟其他指令一樣用預設那組。'));
 
             const visibleLabel = createElement('label', 'stiae-checkbox');
             const visible = createElement('input');
@@ -4360,13 +5426,12 @@
             visible.type = 'checkbox';
             visible.checked = command.visible;
             visibleLabel.append(visible, createElement('span', '', '顯示在編輯器指令列'));
-            form.append(nameField, groupField, newGroupField, row, instructionField, systemField, advanced, visibleLabel);
+            form.append(nameField, groupField, newGroupField, row, instructionField, cardsField, apiField, visibleLabel);
             hostWindow.setTimeout(() => name.focus(), 0);
         }, form => {
             const name = form.elements.name.value.trim();
             const instruction = form.elements.instruction.value.trim();
             if (!name || !instruction) return undefined;
-            const maxTokensValue = Number(form.elements.maxTokens.value);
             return normalizeCommand({
                 ...command,
                 name,
@@ -4375,13 +5440,35 @@
                 icon: form.elements.icon.value,
                 instruction,
                 mode: form.elements.mode.value,
-                systemPrompt: form.elements.systemPrompt.value.trim(),
-                profileId: form.elements.profileId.value,
-                profileName: getProfiles().find(profileItem => profileItem.id === form.elements.profileId.value)?.name || '',
-                maxTokens: maxTokensValue > 0 ? maxTokensValue : null,
+                apiConfigId: form.elements.apiConfigId.value,
                 visible: form.elements.visible.checked,
             }, 0);
         });
+    }
+
+    // The card list as a dialog, for the command form. Resolves to the edited array, or
+    // null if the user backed out — so 跟隨全域 survives an accidental click on 編輯.
+    function showPromptCardsDialog(title, cards) {
+        return showSimpleForm(title, form => {
+            form.append(createElement(
+                'div',
+                'stiae-help',
+                '由上往下就是送給 AI 的順序。🔒 頭尾兩個鎖住不能動：最上面那段在教 AI 用什麼格式回話，最下面那段是要編修的正文——放最後才不會讓 AI 搞混哪一段才是要改的。',
+            ));
+            const list = createElement('div', 'stiae-command-list');
+            const add = button('新增模組', 'fa-plus');
+            // The array is mutated in place and read back on submit, so there is nothing
+            // for the change callback to do here.
+            const redraw = renderPromptCardList(list, cards, () => {});
+            add.addEventListener('click', async () => {
+                const card = await showPromptCardForm(null);
+                if (!card) return;
+                // One before the end: the last slot belongs to the pinned 目標內文 card.
+                cards.splice(Math.max(cards.length - 1, 1), 0, card);
+                redraw();
+            });
+            form.append(list, add);
+        }, () => normalizePromptCards(cards));
     }
 
     // The clipboard is not reachable from every SillyTavern install, and a settings
@@ -4443,7 +5530,19 @@
         });
     }
 
-    function openSettings(focusProfile = false) {
+    // ⚠️ Tabs, not folding sections. Two of the four panes are drag-to-reorder lists, and
+    // a fold above one of them changes the height of everything below every time it is
+    // opened — landing spots move out from under the pointer mid-drag, which this project
+    // has already shipped once and had to undo. Tabs also keep the promise that there is
+    // only ever one scrolling area on screen.
+    const SETTINGS_TABS = [
+        ['api', 'API 設定', 'fa-plug'],
+        ['commands', '指令設定', 'fa-wand-magic-sparkles'],
+        ['prompt', '提示詞設定', 'fa-layer-group'],
+        ['about', '版本與備份', 'fa-clock-rotate-left'],
+    ];
+
+    function openSettings(initialTab = 'api') {
         if (state.activeSettings) return;
         const draft = clone(state.settings);
         const overlay = createElement('div', `${ROOT_CLASS} stiae-overlay stiae-sub-layer`);
@@ -4453,28 +5552,107 @@
         const close = createElement('button', 'stiae-close', '×');
         close.type = 'button';
         header.append(close);
+        const tabBar = createElement('nav', 'stiae-tabbar');
         const body = createElement('div', 'stiae-settings-body');
+        const panes = {};
+        for (const [id] of SETTINGS_TABS) panes[id] = createElement('div', 'stiae-tabpane');
 
-        const profileField = createElement('div', 'stiae-field');
-        profileField.append(createElement('label', '', '預設 Connection Profile'));
-        const profileSelect = createElement('select');
-        addProfileOptions(profileSelect, draft.defaultProfileId);
-        profileField.append(profileSelect, createElement('div', 'stiae-help', '此 Profile 只供 AI 內文編輯器使用，不會切換主聊天連線。'));
+        // ── API 設定 ──────────────────────────────────────────────
+        const apiList = createElement('div', 'stiae-command-list');
+        const addApiConfig = button('新增一組 API 設定', 'fa-plus');
+        const renderApiConfigs = () => {
+            apiList.replaceChildren();
+            if (!draft.apiConfigs.length) {
+                apiList.append(createElement('div', 'stiae-help', '還沒有任何 API 設定。按下面那顆按鈕新增一組，填入網址、金鑰與模型，這個工具才有 AI 可以用。'));
+            }
+            if (draft.apiConfigs.length && !draft.apiConfigs.some(config => config.id === draft.defaultApiConfigId)) {
+                draft.defaultApiConfigId = draft.apiConfigs[0].id;
+            }
+            draft.apiConfigs.forEach((config, index) => {
+                const row = createElement('div', 'stiae-command-row stiae-command-row-plain');
+                const pick = createElement('input');
+                pick.type = 'radio';
+                pick.name = 'stiae-default-api';
+                pick.checked = config.id === draft.defaultApiConfigId;
+                pick.title = '設為預設';
+                pick.addEventListener('change', () => {
+                    draft.defaultApiConfigId = config.id;
+                    renderApiConfigs();
+                });
+                const label = createElement('div');
+                const title = createElement('strong', '', config.name);
+                label.append(title);
+                const marks = [config.endpoint || '⚠ 未填網址', config.model || '⚠ 未填模型'];
+                // ⚠️ Said out loud. A group with no key looks completely normal until a
+                // command is pressed, and an imported backup never carries one.
+                if (!config.apiKey) marks.push('⚠ 未填金鑰，這組還不能用');
+                if (config.viaBackend) marks.push('由酒館伺服器送出');
+                if (config.id === draft.defaultApiConfigId) marks.push('預設');
+                const meta = createElement('div', 'stiae-help', marks.join(' · '));
+                if (!config.apiKey || !config.endpoint || !config.model) meta.classList.add('stiae-warn');
+                label.append(meta);
+                const actions = createElement('div', 'stiae-command-row-actions');
+                const edit = button('', 'fa-pen', 'stiae-icon-button');
+                edit.title = '編輯';
+                edit.addEventListener('click', async () => {
+                    const updated = await showApiConfigForm(config);
+                    if (!updated) return;
+                    draft.apiConfigs[index] = updated;
+                    renderApiConfigs();
+                });
+                const remove = button('', 'fa-trash', 'stiae-icon-button');
+                remove.title = '刪除';
+                remove.addEventListener('click', async () => {
+                    const resolved = resolveCommands(draft);
+                    const users = [...resolved.builtins, ...resolved.customs]
+                        .filter(command => command.apiConfigId === config.id);
+                    const warn = users.length
+                        ? `\n\n有 ${users.length} 條指令指定用這一組，刪掉之後它們會改用預設那一組。`
+                        : '';
+                    if (!await showConfirm(`刪除 API 設定「${config.name}」嗎？${warn}`, { confirmLabel: '刪除', danger: true })) return;
+                    draft.apiConfigs.splice(index, 1);
+                    renderApiConfigs();
+                });
+                actions.append(edit, remove);
+                row.append(pick, label, actions);
+                apiList.append(row);
+            });
+        };
+        addApiConfig.addEventListener('click', async () => {
+            const created = await showApiConfigForm(null);
+            if (!created) return;
+            draft.apiConfigs.push(created);
+            if (!draft.defaultApiConfigId) draft.defaultApiConfigId = created.id;
+            renderApiConfigs();
+        });
+        renderApiConfigs();
+        panes.api.append(
+            createElement('div', 'stiae-field-label', 'API 設定'),
+            createElement('div', 'stiae-help', '這個工具用它自己的 AI 連線，跟你主聊天用哪個模型完全無關，也不會去動它。左邊的圓點是「平常預設用哪一組」；每條指令也可以在自己的設定裡指定要用別組。'),
+            apiList,
+            addApiConfig,
+        );
 
-        const tokensField = createElement('div', 'stiae-field');
-        tokensField.append(createElement('label', '', '預設最大輸出 Tokens'));
-        const tokens = createElement('input');
-        tokens.type = 'number';
-        tokens.min = '64';
-        tokens.step = '1';
-        tokens.value = String(draft.defaultMaxTokens);
-        tokensField.append(tokens);
-
-        const promptField = createElement('div', 'stiae-field');
-        promptField.append(createElement('label', '', '全域編輯原則'));
-        const prompt = createElement('textarea');
-        prompt.value = draft.globalPrompt;
-        promptField.append(prompt, createElement('div', 'stiae-help', '每次請求都會附上。輸出標籤與範圍限制屬於輸出協定，不受這裡影響。'));
+        // ── 提示詞設定 ────────────────────────────────────────────
+        const cardList = createElement('div', 'stiae-command-list');
+        const addCard = button('新增模組', 'fa-plus');
+        const redrawCards = () => renderPromptCardList(cardList, draft.promptCards, cards => { draft.promptCards = cards; });
+        addCard.addEventListener('click', async () => {
+            const card = await showPromptCardForm(null);
+            if (!card) return;
+            draft.promptCards.splice(Math.max(draft.promptCards.length - 1, 1), 0, card);
+            redrawCards();
+        });
+        redrawCards();
+        panes.prompt.append(
+            createElement('div', 'stiae-field-label', '提示詞模組'),
+            createElement('div', 'stiae-help', '由上往下就是送給 AI 的順序。你可以新增自己的模組、調整順序，或暫時把某一段關起來。'),
+            createElement('div', 'stiae-help', '🔒 頭尾兩個鎖住不能動：最上面那段在教 AI 用什麼格式回話，最下面那段是要編修的正文——放最後才不會讓 AI 搞混哪一段才是要改的。'),
+            createElement('div', 'stiae-help', '⚙️ 這幾個的內容是你按下指令的當下工具自動填進去的，改不了，但位置可以調。'),
+            cardList,
+            addCard,
+            createElement('div', 'stiae-help', '這一份是所有指令共用的。除非某條指令自己動過模組（那時它會有一份專屬的），否則改這裡就等於改全部。'),
+        );
 
         const builtinHeader = createElement('div', 'stiae-field-label', '內建指令');
         const builtinList = createElement('div', 'stiae-command-list');
@@ -4933,6 +6111,34 @@
             'stiae-reference-bad',
             '你的酒館助手需要 4.8.0 以上才能一鍵更新。目前只能查新版，更新請手動匯入。',
         );
+        const changelogBox = createElement('div', 'stiae-changelog');
+
+        // ⚠️ The notes shown are the NEW version's, lifted out of the source that 檢查更新
+        // already downloaded — no second request. Reading only the local constant would be
+        // backwards: it can only describe the version already installed, which says
+        // nothing about whether to update. Before any check has run, and after an update,
+        // the local constant is the honest thing to show.
+        const renderChangelog = () => {
+            changelogBox.replaceChildren();
+            const remote = state.update.changelog;
+            const entries = remote
+                ? changelogSince(remote, VERSION)
+                : parseChangelog(CHANGELOG);
+            const heading = remote && entries.length ? `更新後你會拿到（${entries.length} 個版本）` : '版本日誌';
+            changelogBox.append(createElement('div', 'stiae-field-label', heading));
+            if (!entries.length) {
+                changelogBox.append(createElement('div', 'stiae-help', remote
+                    ? '這一版沒有附上變更說明。'
+                    : '讀不到版本日誌。'));
+                return;
+            }
+            for (const entry of entries.slice(0, 10)) {
+                changelogBox.append(createElement('div', 'stiae-changelog-version', entry.version));
+                const list = createElement('ul', 'stiae-changelog-notes');
+                for (const note of entry.notes) list.append(createElement('li', '', note));
+                changelogBox.append(list);
+            }
+        };
 
         const renderUpdate = () => {
             const supported = scriptUpdateApiAvailable();
@@ -4950,6 +6156,7 @@
             installUpdate.querySelector('span').textContent = newer ? `更新到 ${latest}` : '更新腳本';
             installUpdate.classList.toggle('stiae-hidden', !supported);
             updateUnsupported.classList.toggle('stiae-hidden', supported);
+            renderChangelog();
         };
         state.updateRender = renderUpdate;
         renderUpdate();
@@ -4958,10 +6165,7 @@
 
         renderBuiltins();
         renderCommands();
-        body.append(
-            profileField,
-            tokensField,
-            promptField,
+        panes.commands.append(
             builtinHeader,
             builtinList,
             createElement('div', 'stiae-help', '內建指令不能刪除，也不與客製指令混合排序。'),
@@ -4971,32 +6175,51 @@
             addCommand,
             commandBackupRow,
             commandBackupHelp,
-            // No divider elements between the blocks: .stiae-field-label carries its own
-            // rule and spacing, so each heading separates itself from what came before.
-            // Having both drew two lines with a gap trapped between them.
-            //
-            // ⚠️ 正則規則 used to sit here. It moved to the editor's sidebar in 0.8.0 and
-            // must not come back: there it is ticked and saved on the spot, and a second
-            // copy on this dialog's draft model would commit on 儲存設定 instead — two
-            // checkboxes for one setting, free to disagree.
-            backupHeader,
-            backupRow,
-            backupHelp,
+        );
+        // No divider elements between the blocks: .stiae-field-label carries its own
+        // rule and spacing, so each heading separates itself from what came before.
+        // Having both drew two lines with a gap trapped between them.
+        //
+        // ⚠️ 正則規則 used to sit here. It moved to the editor's sidebar in 0.8.0 and
+        // must not come back: there it is ticked and saved on the spot, and a second
+        // copy on this dialog's draft model would commit on 儲存設定 instead — two
+        // checkboxes for one setting, free to disagree.
+        panes.about.append(
             updateHeader,
             updateStatus,
             updateRow,
+            changelogBox,
             updateHelp,
             updateNoAuto,
             updateRisk,
             updateLink,
             updateUnsupported,
+            backupHeader,
+            backupRow,
+            backupHelp,
         );
+
+        for (const [id, label, icon] of SETTINGS_TABS) {
+            const tab = button(label, icon, 'stiae-tab');
+            tab.dataset.tab = id;
+            tab.addEventListener('click', () => showTab(id));
+            tabBar.append(tab);
+            body.append(panes[id]);
+        }
+        const showTab = wanted => {
+            for (const tab of tabBar.children) tab.classList.toggle('stiae-tab-on', tab.dataset.tab === wanted);
+            for (const [id] of SETTINGS_TABS) panes[id].classList.toggle('stiae-hidden', id !== wanted);
+            // Each pane is its own scroll position; landing on a tab half-way down is
+            // the sort of thing that reads as a rendering bug.
+            body.scrollTop = 0;
+        };
+        showTab(SETTINGS_TABS.some(([id]) => id === initialTab) ? initialTab : 'api');
 
         const footer = createElement('footer', 'stiae-footer');
         const cancel = button('取消', 'fa-xmark');
         const save = button('儲存設定', 'fa-check', 'stiae-primary');
         footer.append(cancel, save);
-        modal.append(header, body, footer);
+        modal.append(header, tabBar, body, footer);
         overlay.append(modal);
         hostDocument.body.append(overlay);
         state.activeSettings = overlay;
@@ -5006,15 +6229,10 @@
             state.activeSettings = null;
             state.updateRender = null;
         };
-        // The three plain fields only live in the DOM until this runs, so both saving
-        // and copying have to pull them in first — otherwise a copied backup silently
-        // carries the values from before the user's latest edits.
+        // Every pane writes straight into `draft` as it is edited, so there are no loose
+        // DOM values left to gather here. What this function is still for is the settings
+        // this dialog does NOT own.
         const collectDraft = () => {
-            draft.defaultProfileId = profileSelect.value;
-            draft.defaultProfileName = getProfiles().find(profile => profile.id === profileSelect.value)?.name || '';
-            draft.globalPrompt = prompt.value.trim() || DEFAULT_GLOBAL_PROMPT;
-            const tokenValue = Number(tokens.value);
-            draft.defaultMaxTokens = tokenValue >= 64 ? Math.round(tokenValue) : 2048;
             // ⚠️ Taken from the live settings, not from the draft. 檢查更新 lives in this
             // same dialog and saves its result immediately; copying the draft's stale
             // value over it would throw away the answer the user just asked for.
@@ -5042,7 +6260,7 @@
             const parsed = await showSettingsImport();
             if (!parsed) return;
             const overwrite = await showConfirm(
-                '確定要用貼上的設定覆蓋目前全部設定嗎？目前的 Connection Profile、全域編輯原則、內建指令修改與客製指令都會被取代。',
+                '確定要用貼上的設定覆蓋目前全部設定嗎？目前的 API 設定、提示詞模組、內建指令修改與客製指令都會被取代。設定代碼不含 API 金鑰，匯入後要重新填一次。',
                 { confirmLabel: '覆蓋設定', danger: true },
             );
             if (!overwrite) return;
@@ -5081,7 +6299,6 @@
             toast('success', 'AI 內文編輯器設定已儲存。');
             dismiss();
         });
-        if (focusProfile) hostWindow.setTimeout(() => profileSelect.focus(), 0);
     }
 
     // ══════ 生命週期：事件、清理、啟動 ══════
