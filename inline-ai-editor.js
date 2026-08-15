@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.9.0';
+    const VERSION = '0.9.1';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -87,6 +87,22 @@
     // switch at all. core.test.cjs asserts the message contains this constant.
     const BACKEND_SWITCH_LABEL = '改由酒館的伺服器幫忙送出';
 
+    // ⚠️ Keys the extra-parameters box may not set. The first three would break the
+    // request outright — `messages` and `model` are the whole contract, and `stream`
+    // decides which parsing path the code takes, so overriding it desyncs the reader from
+    // the reply. `temperature` and `max_tokens` are blocked for a different reason: they
+    // have their own fields two rows up, and one setting reachable from two places is a
+    // setting nobody can predict.
+    const EXTRA_BODY_RESERVED = ['model', 'messages', 'stream', 'temperature', 'max_tokens'];
+
+    // Typing aids, not knowledge. The tool never inspects what is in the box at send
+    // time — these only fill the textarea, so a provider changing its parameter is a
+    // stale example rather than a branch that silently stops working (產品決策 5).
+    const EXTRA_BODY_PRESETS = [
+        ['OpenRouter：關閉推理', { reasoning: { effort: 'none' } }],
+        ['DeepSeek：關閉推理', { thinking: { type: 'disabled' } }],
+    ];
+
     const MESSAGE_ROLE_LABELS = {
         system: '系統訊息（system）',
         user: '使用者訊息（user）',
@@ -100,7 +116,13 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.9.0
+    const CHANGELOG = `0.9.1
+- API 設定多了「額外參數」欄位：填一段 JSON，會原樣加進送出的請求裡。
+- 最常見的用途是關掉推理模型的思考（DeepSeek 之類的思考又長又貴）。各家參數名稱不一樣，所以不做成勾選框；附了 OpenRouter 與 DeepSeek 兩顆一鍵填入。
+- 直連與「改由酒館的伺服器幫忙送出」兩條路都有效，接法不同但你不用管。
+- model、messages、stream、temperature、max_tokens 這幾個不准在這裡設，填了會明講被忽略。
+
+0.9.0
 - 模型連線改用工具自己的「API 設定」，不再借用 SillyTavern 的 Connection Profile。可以存好幾組，指令能各自指定要用哪一組。
 - 升級後要重新填一次端點與金鑰：金鑰存在酒館伺服器裡，這裡讀不到，搬不過來。
 - 編修請求不再被主聊天的 preset 罩住。送出去的東西現在完全由這個工具決定。
@@ -143,10 +165,7 @@
 0.5.0
 - 世界書條目可以勾選當參考資料，勾選會記住。
 - 參考樓層只在同一個聊天裡記住，換聊天自動清空。
-
-0.4.0
-- 新增附加參考資料與正則勾選。
-- 內建指令可以編輯，並新增設定備份。`;
+`;
 
     // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
     // whose value is "run this in my browser" — the whole safety of this feature rests on
@@ -443,6 +462,12 @@
             // property of that provider, not a preference of the user's.
             viaBackend: config?.viaBackend === true,
             stream: config?.stream !== false,
+            // Anything else this provider wants in the request body — reasoning switches
+            // being the reason it exists. The tool never looks inside: what a provider
+            // calls its thinking parameter changes often enough that a built-in checkbox
+            // would be a guess with an expiry date, and an expired guess looks exactly
+            // like a switch that does nothing (產品決策 5).
+            extraBody: sanitizeExtraBody(config?.extraBody),
         };
     }
 
@@ -672,6 +697,46 @@
     }
 
     // ══════ 純函式：API 端點與回應 ══════
+
+    // ⚠️ Reserved keys are stripped here, not only in the form. Settings can arrive from
+    // an imported backup or a hand-edited variable, and a `messages` key reaching the
+    // request body would replace the entire protocol with whatever was in it — the one
+    // failure this tool cannot afford, because the reply still comes back and still gets
+    // written into the chat.
+    function sanitizeExtraBody(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+        const clean = {};
+        for (const [key, entry] of Object.entries(value)) {
+            if (EXTRA_BODY_RESERVED.includes(key)) continue;
+            clean[key] = entry;
+        }
+        return clean;
+    }
+
+    // Parses what the user typed. Returns { ok, value, blocked } or { ok: false, error }.
+    // Blocked keys are reported rather than dropped in silence: someone who typed
+    // `temperature` there needs to be told it has its own field, not left wondering why
+    // the number they set does nothing.
+    function parseExtraBody(text) {
+        const raw = String(text ?? '').trim();
+        if (!raw) return { ok: true, value: {}, blocked: [] };
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            return { ok: false, error: '這不是有效的 JSON。整段要用大括號包起來，例如 {"reasoning": {"effort": "none"}}' };
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return { ok: false, error: '最外層必須是一個物件（用 { } 包起來），不能是清單或單一數值。' };
+        }
+        const blocked = Object.keys(parsed).filter(key => EXTRA_BODY_RESERVED.includes(key));
+        return { ok: true, value: sanitizeExtraBody(parsed), blocked };
+    }
+
+    function formatExtraBody(value) {
+        const clean = sanitizeExtraBody(value);
+        return Object.keys(clean).length ? JSON.stringify(clean, null, 2) : '';
+    }
 
     // ⚠️ The endpoint is used literally. Nothing is appended to make a bare host look
     // like an API base, and no /v1 is guessed — the field is labelled 端點（基礎網址）and
@@ -1652,6 +1717,12 @@
         resolveApiConfig,
         endpointChatUrl,
         endpointModelsUrl,
+        sanitizeExtraBody,
+        parseExtraBody,
+        formatExtraBody,
+        requestBody,
+        backendPayload,
+        EXTRA_BODY_RESERVED,
         extractModelIds,
         extractNonStreamContent,
         describeRequestError,
@@ -4013,6 +4084,10 @@
 
     function requestBody(config, messages, stream) {
         const body = {
+            // ⚠️ Extras first so the known fields always win. sanitizeExtraBody already
+            // strips the reserved keys, so this cannot matter today — it is here so that
+            // it still cannot matter if that list is ever widened by mistake.
+            ...config.extraBody,
             model: config.model,
             messages,
             max_tokens: config.maxTokens,
@@ -4043,20 +4118,30 @@
     // stripped here. Getting that wrong sends the request somewhere the user never typed.
     function backendPayload(config, messages, stream) {
         const url = endpointChatUrl(config.endpoint).replace(/\/chat\/completions$/, '');
-        const { model, messages: body, max_tokens: maxTokens, ...rest } = requestBody(config, messages, stream);
-        delete rest.stream;
-        return {
+        const payload = {
             chat_completion_source: 'custom',
             custom_url: url,
             // Must be a string: the backend runs it through a YAML parse, and JSON is
             // valid YAML.
             custom_include_headers: JSON.stringify({ Authorization: `Bearer ${config.apiKey}` }),
-            model,
-            messages: body,
-            max_tokens: maxTokens,
+            model: config.model,
+            messages,
+            max_tokens: config.maxTokens,
             stream: Boolean(stream),
-            ...rest,
         };
+        if (config.temperature !== null) payload.temperature = config.temperature;
+        // ⚠️ Extra parameters CANNOT ride along as loose keys on this path, and this is
+        // the whole reason the two paths are built separately instead of one being
+        // derived from the other. Verified in SillyTavern's source: for
+        // chat_completion_source 'custom' the server builds the upstream body from named
+        // fields only, then merges `custom_include_body` into it
+        // (mergeObjectWithYaml(bodyParams, request.body.custom_include_body)). A stray
+        // `reasoning` key sitting at the top level is simply dropped — the request still
+        // succeeds, reasoning is still on, and nothing anywhere says why.
+        if (Object.keys(config.extraBody).length) {
+            payload.custom_include_body = JSON.stringify(config.extraBody);
+        }
+        return payload;
     }
 
     function backendService() {
@@ -5061,12 +5146,59 @@
             stream.checked = config.stream;
             streamLabel.append(stream, createElement('span', '', '一邊生成一邊顯示'));
 
+            // Free-form on purpose. What a provider calls its thinking switch differs per
+            // provider and moves fast — a built-in 「關閉推理」 checkbox would have to guess
+            // which parameter to send, and a stale guess reads as a switch that does
+            // nothing. The buttons below only type for you; nothing here is understood at
+            // send time.
+            const extraField = createElement('div', 'stiae-field');
+            extraField.append(createElement('label', '', '額外參數（選填）'));
+            const extraBody = createElement('textarea');
+            extraBody.name = 'extraBody';
+            extraBody.rows = 4;
+            extraBody.value = formatExtraBody(config.extraBody);
+            extraBody.placeholder = '{\n  "reasoning": { "effort": "none" }\n}';
+            const extraHint = createElement('div', 'stiae-help');
+            const extraPresets = createElement('div', 'stiae-command-row-actions');
+            for (const [label, value] of EXTRA_BODY_PRESETS) {
+                const fill = button(label, 'fa-paste');
+                fill.addEventListener('click', () => {
+                    extraBody.value = JSON.stringify(value, null, 2);
+                    extraBody.dispatchEvent(new hostWindow.Event('input', { bubbles: true }));
+                });
+                extraPresets.append(fill);
+            }
+            const paintExtra = () => {
+                const parsed = parseExtraBody(extraBody.value);
+                if (!parsed.ok) {
+                    extraHint.textContent = `⚠ ${parsed.error}`;
+                    extraHint.classList.add('stiae-warn');
+                    return;
+                }
+                extraHint.classList.remove('stiae-warn');
+                extraHint.textContent = parsed.blocked.length
+                    ? `⚠ ${parsed.blocked.join('、')} 會被忽略——這幾項有自己的欄位，或動了就會讓工具壞掉。`
+                    : '';
+                if (parsed.blocked.length) extraHint.classList.add('stiae-warn');
+            };
+            extraBody.addEventListener('input', paintExtra);
+            paintExtra();
+            extraField.append(
+                extraBody,
+                extraHint,
+                createElement('div', 'stiae-help', '原樣加進送出的請求裡，工具不會去讀它。**留空就什麼都不加。**'.replace(/\*\*/g, '')),
+                createElement('div', 'stiae-help', '最常見的用途是**關掉推理模型的思考**——DeepSeek 之類的模型思考又長又貴，而各家的參數名稱不一樣，所以這裡不做成勾選框。下面兩顆按鈕會幫你填好；其他服務商請查它自己的文件，⚠ 要查的是它「OpenAI 相容端點」接受的參數，不是原生 API 的格式。'.replace(/\*\*/g, '')),
+                extraPresets,
+                createElement('div', 'stiae-help', '⚠ 有些模型關不掉推理（例如 Claude 的 Fable 5／Mythos 5 是常開的）。另外 OpenRouter 的 exclude 只是不回傳思考內容，模型照樣想、照樣花時間——要真的關掉是 effort: "none"。'),
+            );
+
             form.append(
                 nameField,
                 endpointField,
                 keyField,
                 modelField,
                 row,
+                extraField,
                 backendLabel,
                 createElement('div', 'stiae-help', '按下指令卻說「連不上」的時候，勾這個。有些服務商不允許網頁直接連它（這是瀏覽器的安全限制，不是你設定錯）；勾了之後改由 SillyTavern 自己的伺服器去送同一個請求，用的還是上面那組網址與金鑰。「載入模型」也會跟著改走這條路。'),
                 streamLabel,
@@ -5077,6 +5209,15 @@
             const name = form.elements.name.value.trim();
             const endpoint = form.elements.endpoint.value.trim();
             if (!name || !endpoint) return undefined;
+            // ⚠️ Invalid JSON refuses the save rather than being stored and failing later.
+            // A parse error at send time would surface as a failed edit with a message
+            // about syntax, hours after the typo and nowhere near the box it came from.
+            const extra = parseExtraBody(form.elements.extraBody.value);
+            if (!extra.ok) {
+                toast('error', `額外參數：${extra.error}`);
+                return undefined;
+            }
+            if (extra.blocked.length) toast('warning', `額外參數裡的 ${extra.blocked.join('、')} 已被忽略。`);
             return normalizeApiConfig({
                 ...config,
                 name,
@@ -5087,6 +5228,7 @@
                 maxTokens: form.elements.maxTokens.value,
                 viaBackend: form.elements.viaBackend.checked,
                 stream: form.elements.stream.checked,
+                extraBody: extra.value,
             }, 0);
         });
     }
@@ -5587,6 +5729,7 @@
                 // command is pressed, and an imported backup never carries one.
                 if (!config.apiKey) marks.push('⚠ 未填金鑰，這組還不能用');
                 if (config.viaBackend) marks.push('由酒館伺服器送出');
+                if (Object.keys(config.extraBody).length) marks.push(`額外參數 ${Object.keys(config.extraBody).join('、')}`);
                 if (config.id === draft.defaultApiConfigId) marks.push('預設');
                 const meta = createElement('div', 'stiae-help', marks.join(' · '));
                 if (!config.apiKey || !config.endpoint || !config.model) meta.classList.add('stiae-warn');
