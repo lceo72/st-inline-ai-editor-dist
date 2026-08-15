@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.9.2';
+    const VERSION = '0.10.0';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -53,6 +53,34 @@
     // assembly time. That is what lets the default arrangement produce byte-for-byte
     // what 0.8.0 produced while still leaving the line as something the user can delete.
     const DEFAULT_PRINCIPLES_CARD = `Editing principles:\n${DEFAULT_GLOBAL_PROMPT}`;
+
+    // 0.10.0's factory content. Two cards, both system-role, shipped as a copy into every
+    // command that has never been edited (ADR-0008).
+    //
+    // ⚠️ English is the source of record. custom_instructions/ has a Chinese translation
+    // that has never been tested against a model — do not swap it in here.
+    const DEFAULT_ROLE_CARD = [
+        'You are a line editor, hired directly by the author, working on their novel. The story, the established facts, and the character voices stay theirs. When the task calls for new prose, write it in their voice, using only material already on the page.',
+        '',
+        'Never produce the version you would have written. Carry out the change the task names, leave the rest alone, and keep the passage recognisably written by the same person.',
+    ].join('\n');
+
+    // The five steps are a checklist, not prose — each one names a failure it exists to
+    // stop, and the closing tag is the commitment point the length limit hangs on. The
+    // tag is deliberately not <thinking>: some presets leave a stray one in the message.
+    const DEFAULT_METHOD_CARD = [
+        'Your reply has two parts, in this order: the <precheck> block, then whatever the protocol specifies. The protocol\'s "return only" governs everything after </precheck>; the precheck itself is required and sits outside it. A reply that opens with <search> or <replacement> is incomplete.',
+        '',
+        'Work through five steps inside <precheck>…</precheck>. Output begins only after the tag closes.',
+        '',
+        '1. Register. How is this passage written: sentence length, how much narration sits between lines of dialogue, person and tense, plain words or set phrases. Whatever you write has to land inside that. Also name one habit of your own that would read as foreign here.',
+        '2. Targets. Where exactly does this task\'s problem sit? Quote the passages. List only the ones you intend to change. If the task is to rewrite the whole passage, write "whole scope" and move on. If there is nothing to change, say so; do not go hunting.',
+        '3. Facts. What does this passage establish (who knows what, who is where, what exists, when it happened, who did what), and what rests on those facts. One line each, arrows for the links, no explanation. When you look beyond this passage, say which ranges you were actually able to read.',
+        '4. Method. How you intend to handle each target, and why that handling will read as different to a reader. Method and effect only; do not draft the finished sentences here.',
+        '5. Check. Does every target have a method (say so if one does not)? Do the linked lines from step 3 still hold in your version, including against anything you are adding? Does your method still sit inside the register from step 1?',
+        '',
+        'One or two sentences per step, quotes not counted. Do not revise a step once written. <search> and <replace> never appear inside <precheck>; they belong after </precheck>.',
+    ].join('\n');
 
     // Three slots whose text is produced at send time. The user can drag them and, for
     // 參考資料, watch them fall away when there is nothing to put in them — but the words
@@ -108,7 +136,14 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.9.2
+    const CHANGELOG = `0.10.0
+- **提示詞模組不再有「全域一份」這回事。** 每條指令送出的模組清單就是它自己的，設定視窗的「提示詞設定」分頁已移除。
+- 出廠內容改成**每條指令各自帶一份**，四個內建指令因此可以有不一樣的角色宣告——潤飾要找的是壞掉的句子，重寫是整段重新生成，一份共用的宣告必須寫得夠空才涵蓋得了兩者，而夠空就等於沒說。
+- 內建指令的指示全部換新，出廠模組改成「角色宣告 + 思考流程」兩張。沒動過的指令會直接拿到新版；動過的維持你自己那份（跟以前一樣不會被升級碰到）。
+- 臨時指令變成第五個內建指令：它一樣有自己的模組清單、可以編輯、可以還原，只是指示每次自己打。
+- 每條指令的編輯表單都有「還原成預設」了，客製指令也有。
+
+0.9.2
 - 「額外參數」拿掉了那兩顆一鍵填入的範例按鈕。那個欄位就是單純讓你加參數用的，不是「關推理」專用；而寫死在畫面上的範例遲早會過期。
 - 改成跟「API 網址」同一個做法：**空欄時用灰字示範格式**（一個平的鍵、一個巢狀的），並講明你填的鍵是加在請求的最外層。教格式而不推薦內容。
 - 關掉推理的實際寫法搬到 README。
@@ -156,9 +191,6 @@
 - 差異視窗每一個有變更的行都能個別勾選要不要採用，預設全勾。
 - 局部修補與全文改寫都適用。
 
-0.5.1
-- 臨時指令在同一個編輯器裡會記住剛剛打的字。
-
 `;
 
     // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
@@ -193,34 +225,80 @@
         ['fa-book-open', '敘事'],
     ];
 
+    // ⚠️ Each entry may carry its own promptCards. None do yet — all five ship the same
+    // two factory cards — but the field is the whole point of ADR-0008: 潤飾 hunts for
+    // broken sentences while 重寫 regenerates the passage, and one shared 角色宣告 covering
+    // both has to be written vague enough to say nothing. Per-command cards are how that
+    // gets fixed, one command at a time, without touching the other four.
     const BUILTIN_ACTIONS = [
         {
             id: 'rewrite',
             name: '重寫',
             icon: 'fa-pen',
             mode: 'replacement',
-            instruction: 'Rewrite the scope. Keep the meaning, the character voice, the narrative POV, and roughly the same length; improve the phrasing and the readability.',
+            instruction: [
+                'Write this passage again. What happens inside it can be rearranged, and the original wording does not have to survive.',
+                '',
+                'What cannot change is the state at each end: where people are, who is present and what has just happened at the start; where the story stands and what state each character is in at the finish. The next message follows on from here, and a seam that does not join is a failure.',
+                '',
+                'Between those two points, the actions, the dialogue, the order, and which details get written are all open. Facts that other things rest on stay as they are; details with nothing resting on them can be generated afresh.',
+                '',
+                'Keep the length close to the original. When the scope is a selected passage, the opening and closing have to join back to the text around it.',
+            ].join('\n'),
         },
         {
             id: 'shorten',
             name: '縮短',
             icon: 'fa-scissors',
             mode: 'replacement',
-            instruction: 'Shorten the scope. Cut repetition and padding; keep the information, the voice, and every plot fact.',
+            // ⚠️ No reduction ratio, deliberately. A quota makes the model cut words that
+            // are still working in order to hit it, and that failure is written back into
+            // the manuscript. "Work through the ones you found and stop there" is a
+            // completion condition instead — how long the list is, the passage decides.
+            instruction: [
+                'Tighten this passage without losing a single piece of information.',
+                'Targets: the same thing said twice, modifiers that carry nothing, scenery and expressions dwelt on past their use, one action broken into several smaller ones.',
+                'Work through the ones you found and stop there. Do not cut words that are still doing something just to show progress.',
+                'Do not lower the count by deleting particles and function words, and do not chop long sentences into strings of short ones; that shortens the text without tightening it.',
+            ].join('\n'),
         },
         {
             id: 'expand',
             name: '擴寫',
             icon: 'fa-up-right-and-down-left-from-center',
             mode: 'replacement',
-            instruction: 'Expand the scope with sensory detail, action, or beats. Every addition follows from what the passage already establishes, and every character keeps the intent they already had.',
+            // ⚠️ This names targets, not techniques. 0.9.x said "expand with sensory
+            // detail, action, or beats" — naming a technique got stacked adjectives back.
+            // Say where the passage is thin and the model picks the technique itself.
+            instruction: [
+                'Find where the passage moves too fast, where a reaction is owed and not given, where a key action is covered in a single line. Those are the places you fill in.',
+                'Do not pad the length with stacked modifiers and sensory detail. Everything you add is something the reader was already waiting for.',
+                'Character intent stays as it is, event order stays as it is, and nothing happens that did not happen before.',
+            ].join('\n'),
         },
         {
             id: 'polish',
             name: '潤飾',
             icon: 'fa-spell-check',
             mode: 'patch',
-            instruction: 'Correct grammar, punctuation, word choice, and flow. Change only what is wrong and leave sound passages as they stand.',
+            // The last sentence is the line between this and 重寫. Without it the two
+            // buttons do the same job.
+            instruction: [
+                'Fix what is broken: grammar, punctuation, wrong characters, imprecise word choice, sentences that stumble.',
+                'Leave sound sentences untouched. This task does not touch content, pacing, or matters of taste.',
+            ].join('\n'),
+        },
+        {
+            // 臨時指令. A builtin like the other four — it has its own card list, can be
+            // edited, can be reset — except the 指示 arrives from the dialog each time
+            // instead of being stored. The blank instruction is what keeps it off the
+            // toolbar (the toolbar only draws commands whose instruction is non-empty);
+            // it has its own button next to them.
+            id: 'one-off',
+            name: '臨時指令',
+            icon: 'fa-comment-dots',
+            mode: 'patch',
+            instruction: '',
         },
     ];
 
@@ -291,7 +369,11 @@
         return `${prefix}-${random}`;
     }
 
-    function normalizeCommand(command, index) {
+    // carriedCards: only normalizeSettings passes it, and only on the one save that
+    // migrates a customised 0.9.x global list. Everywhere else — new commands, imported
+    // command codes — it is absent, and a command with no cards of its own simply gets
+    // the factory arrangement at send time.
+    function normalizeCommand(command, index, carriedCards = null) {
         return {
             id: String(command?.id || makeId()),
             name: String(command?.name || `指令 ${index + 1}`),
@@ -309,14 +391,19 @@
             // longer talks to (ADR-0005), and the key that would make it usable — the
             // API key — lives in the server's secrets and was never readable from here.
             apiConfigId: String(command?.apiConfigId || ''),
-            // null means 跟隨全域 — this command has no list of its own and uses the one
-            // in settings. An array means the user has edited it, and it froze at that
-            // moment (ADR-0007). ⚠️ Not `|| null`: an empty array is a real answer (the
-            // user deleted every card they could delete) and must not collapse back into
-            // "follow the global list".
+            // null means this command has never had its cards edited, so it sends a copy
+            // of the factory arrangement (ADR-0008). An array means the user has edited
+            // it and it froze at that moment.
+            //
+            // ⚠️ Not `|| null`: an empty array is a real answer (the user deleted every
+            // card they could delete) and must not collapse back into "use the factory
+            // cards" — those cards would grow back on the next save with no action taken.
+            //
+            // carriedCards is 0.9.x's customised global list during the one migration
+            // that needs it, and null every other time.
             promptCards: Array.isArray(command?.promptCards)
                 ? normalizePromptCards(command.promptCards)
-                : migrateSystemPromptToCards(command?.systemPrompt),
+                : (migrateSystemPromptToCards(command?.systemPrompt) ?? (carriedCards ? clone(normalizePromptCards(carriedCards)) : null)),
             visible: command?.visible !== false,
         };
     }
@@ -324,7 +411,10 @@
     // 0.8.0 stored a command's 編輯原則覆寫 as one block of text that replaced the global
     // principles outright. It becomes exactly one frozen card carrying that same text,
     // with no other user card beside it — so the bytes this command sends do not change
-    // on the release that introduces cards. Nothing stored means 跟隨全域.
+    // on the release that introduces cards.
+    //
+    // Returning null means the command never had one, and a command with no cards of its
+    // own sends the factory arrangement (ADR-0008).
     function migrateSystemPromptToCards(systemPrompt) {
         const text = String(systemPrompt || '').trim();
         if (!text) return null;
@@ -371,14 +461,27 @@
         };
     }
 
-    // The factory arrangement, and the one the literal-string test in core.test.cjs
-    // locks: it must assemble into exactly the bytes 0.8.0 sent.
+    // The factory arrangement. A command that has never been edited sends a copy of this
+    // (ADR-0008) — there is no global list any more, so this is the only place the words
+    // come from.
+    //
+    // ⚠️ 0.9.x's invariant "the default arrangement assembles into exactly the bytes 0.8.0
+    // sent" ends here, deliberately and in two ways: the 編輯原則 card is gone, and
+    // 參考資料 now sits before 指示 so the task lands next to the prose it applies to.
+    // core.test.cjs's literal-string test locks the new arrangement instead — still hand
+    // typed, never assembled from the constants, because a test built out of the thing it
+    // checks agrees with every bug it contains.
+    //
+    // Every call returns fresh objects (makeId per card). Do not memoise this: two
+    // commands holding the same array would edit each other, and the list is spliced in
+    // place by the card dialog.
     function defaultPromptCards() {
         return normalizePromptCards([
             { kind: 'protocol' },
-            { kind: 'user', name: '編輯原則', content: DEFAULT_PRINCIPLES_CARD, role: 'system' },
-            { kind: 'system', slot: 'instruction' },
+            { kind: 'user', name: '角色宣告', content: DEFAULT_ROLE_CARD, role: 'system', tag: 'role' },
+            { kind: 'user', name: '思考流程', content: DEFAULT_METHOD_CARD, role: 'system', tag: 'method' },
             { kind: 'system', slot: 'reference' },
+            { kind: 'system', slot: 'instruction' },
             { kind: 'system', slot: 'target' },
         ]);
     }
@@ -423,11 +526,22 @@
         return card?.kind === 'protocol' || (card?.kind === 'system' && card.slot === PINNED_LAST);
     }
 
-    // Which list a command actually sends. null means 跟隨全域 (ADR-0007).
-    function resolvePromptCards(settings, command) {
+    // Which list a command actually sends. A command that has never had its cards edited
+    // stores nothing and gets a fresh copy of the factory arrangement — its own, if the
+    // builtin declares one, otherwise the shared default (ADR-0008).
+    //
+    // ⚠️ Takes the command, not the settings. Reaching for settings.promptCards here is
+    // what the old signature did, and that key no longer exists: normalizePromptCards
+    // (undefined) does not throw, it returns a list with the protocol and the three
+    // generated cards and NO user cards at all. The request would go out, come back, and
+    // be written into the chat with the role and method cards silently missing.
+    function resolvePromptCards(command) {
         const own = command?.promptCards;
         if (Array.isArray(own)) return normalizePromptCards(own);
-        return normalizePromptCards(settings?.promptCards);
+        const builtin = BUILTIN_ACTIONS.find(action => action.id === command?.id);
+        return Array.isArray(builtin?.promptCards)
+            ? normalizePromptCards(builtin.promptCards)
+            : defaultPromptCards();
     }
 
     // One connection the tool talks to. Everything a request needs is in here, including
@@ -567,19 +681,75 @@
         return typeof value === 'boolean' ? value : fallback;
     }
 
-    // 0.8.0's 全域編輯原則 was one textarea. It becomes the factory arrangement with that
-    // text inside the 編輯原則 card — same bytes out, different container.
+    // 0.9.x's factory arrangement. It exists only to answer one question during migration:
+    // did this user ever change the global list? Nothing sends these cards any more.
+    //
+    // ⚠️ This must NOT be defaultPromptCards(). That one now returns 0.10.0's two cards,
+    // and rebuilding the old shape from the new one would compare the user's list against
+    // the wrong baseline — every user would look like they had customised it.
+    function legacyDefaultPromptCards() {
+        return normalizePromptCards([
+            { kind: 'protocol' },
+            { kind: 'user', name: '編輯原則', content: DEFAULT_PRINCIPLES_CARD, role: 'system' },
+            { kind: 'system', slot: 'instruction' },
+            { kind: 'system', slot: 'reference' },
+            { kind: 'system', slot: 'target' },
+        ]);
+    }
+
+    // Ids are regenerated on every call, so they cannot take part in the comparison —
+    // two identical lists would never match and every user would be treated as having
+    // customised theirs.
+    function promptCardsMatch(left, right) {
+        const flatten = cards => (Array.isArray(cards) ? cards : []).map(card => JSON.stringify([
+            card.kind, card.slot ?? '', card.name ?? '', card.content ?? '',
+            card.tag ?? '', card.role ?? '', card.enabled !== false,
+        ]));
+        const a = flatten(left);
+        const b = flatten(right);
+        return a.length === b.length && a.every((value, index) => value === b[index]);
+    }
+
+    // 0.8.0's 全域編輯原則 was one textarea. It becomes 0.9.x's arrangement with that text
+    // inside the 編輯原則 card.
+    //
+    // ⚠️ It rebuilds the LEGACY arrangement, not the current one. Pointed at
+    // defaultPromptCards(), `cards.find(kind === 'user')` would land on 角色宣告 and
+    // overwrite it with the user's old one-line principle, leaving 思考流程 — text they
+    // have never seen — sitting beside it. Right type, runs fine, wrong meaning.
     function migrateGlobalPromptToCards(globalPrompt) {
         const text = String(globalPrompt ?? '').trim() || DEFAULT_GLOBAL_PROMPT;
-        const cards = defaultPromptCards();
+        const cards = legacyDefaultPromptCards();
         const principles = cards.find(card => card.kind === 'user');
         if (principles) principles.content = `Editing principles:\n${text}`;
         return cards;
     }
 
+    // The global list, read one last time. 0.10.0 has no global list (ADR-0008), but a
+    // user who had customised theirs must not lose those words, so they are carried into
+    // every custom command that was following it.
+    //
+    // Returns null when the stored list still matches 0.9.x's factory content — nobody
+    // touched it, so there is nothing to carry and the commands get 0.10.0's cards.
+    //
+    // ⚠️ Custom commands only. Builtins that were following the global list get the new
+    // factory cards instead: this is the release that replaces their instructions as
+    // well, and carrying old cards onto new instructions ships a mixture nobody wrote.
+    //
+    // ⚠️ Idempotent, and it has to be — normalizeSettings runs on every save. The second
+    // pass finds no settings.promptCards and no settings.globalPrompt, rebuilds 0.9.x's
+    // default from the constants, matches it, and carries nothing.
+    function carriedGlobalCards(settings) {
+        const stored = Array.isArray(settings?.promptCards)
+            ? normalizePromptCards(settings.promptCards)
+            : migrateGlobalPromptToCards(settings?.globalPrompt);
+        return promptCardsMatch(stored, legacyDefaultPromptCards()) ? null : stored;
+    }
+
     function normalizeSettings(raw) {
         const settings = raw && typeof raw === 'object' ? raw : {};
         const rect = settings.editorRect && typeof settings.editorRect === 'object' ? settings.editorRect : {};
+        const carried = carriedGlobalCards(settings);
         return {
             version: VERSION,
             // ⚠️ 0.8.0's defaultProfileId / defaultProfileName / defaultMaxTokens /
@@ -589,10 +759,9 @@
             // back defaults and the user's custom commands evaporate.
             apiConfigs: normalizeApiConfigs(settings.apiConfigs),
             defaultApiConfigId: String(settings.defaultApiConfigId || ''),
-            // The global card list. A command with no list of its own sends this one.
-            promptCards: Array.isArray(settings.promptCards)
-                ? normalizePromptCards(settings.promptCards)
-                : migrateGlobalPromptToCards(settings.globalPrompt),
+            // ⚠️ 0.9.x's promptCards key is read by carriedGlobalCards() above and then
+            // gone. There is no global list in 0.10.0 — every command answers for itself
+            // (ADR-0008).
             lastCustomMode: settings.lastCustomMode === 'replacement' ? 'replacement' : 'patch',
             // The result of the last time 檢查更新 was pressed. Remembered only so the dot
             // on the settings button survives a page reload — nothing here ever triggers a
@@ -622,7 +791,12 @@
             referenceInput: String(settings.referenceInput || ''),
             referenceChatId: String(settings.referenceChatId || ''),
             builtinOverrides: normalizeBuiltinOverrides(settings.builtinOverrides),
-            commands: Array.isArray(settings.commands) ? sortCommandsByGroup(settings.commands.map(normalizeCommand)) : [],
+            // ⚠️ The arrow function is load-bearing. `.map(normalizeCommand)` would hand
+            // Array.prototype.map's third argument — the commands array itself — to the
+            // carried-cards parameter, and the result would normalize without complaint.
+            commands: Array.isArray(settings.commands)
+                ? sortCommandsByGroup(settings.commands.map((command, index) => normalizeCommand(command, index, carried)))
+                : [],
             // Which of the sidebar's three sections are expanded. Remembered because the
             // answer is a working habit, not a per-editor decision: someone who never
             // touches regex rules should not have to fold that section away every time.
@@ -886,7 +1060,14 @@
         return JSON.stringify({
             format: COMMANDS_EXPORT_FORMAT,
             version: VERSION,
-            commands: sortCommandsByGroup((Array.isArray(commands) ? commands : []).map(normalizeCommand)),
+            // ⚠️ The arrow function is load-bearing here too — see normalizeSettings. A
+            // bare .map(normalizeCommand) hands this array to the carriedCards parameter,
+            // and every exported command comes out carrying one blank user card per
+            // command in the list, named after them. The person who imports the code gets
+            // commands frozen at "已改過" with the factory cards gone, and nothing errors.
+            commands: sortCommandsByGroup(
+                (Array.isArray(commands) ? commands : []).map((command, index) => normalizeCommand(command, index)),
+            ),
         }, null, 2);
     }
 
@@ -3603,7 +3784,7 @@
         const modeHelp = createElement(
             'div',
             'stiae-help',
-            '不論按哪個指令，你的要求都會落在同一個位置，所以這裡先用一段假的代替。但「局部修補」和「全文改寫」教 AI 回話的方式完全不同，想看哪一種請自己切。如果某條指令有自己專屬的提示詞模組，它實際送出的會是那一份，不是這裡顯示的。',
+            '不論按哪個指令，你的要求都會落在同一個位置，所以這裡先用一段假的代替。但「局部修補」和「全文改寫」教 AI 回話的方式完全不同，想看哪一種請自己切。這裡的模組是出廠內容；每條指令的模組都是它自己的，動過的那幾條實際送出的會是它們自己那一份。',
         );
         const summary = createElement('div', 'stiae-help');
         const content = createElement('div', 'stiae-preview-rows');
@@ -3625,8 +3806,9 @@
             patchTab.classList.toggle('stiae-tab-on', mode === 'patch');
             rewriteTab.classList.toggle('stiae-tab-on', mode === 'replacement');
             // A stand-in for a real command: the placeholder instruction and the chosen
-            // mode. The card list is the global one, so a command that has frozen its own
-            // list will send something else — the note under the two buttons says so.
+            // mode. There is no global list to show any more (ADR-0008), so this shows the
+            // factory cards — every command starts from them, and the ones that have been
+            // edited send their own. The note under the two buttons says so.
             const action = { instruction: PREVIEW_INSTRUCTION, mode };
             const scope = scopeFromTextarea(session.textarea);
             summary.textContent = '正在組裝…';
@@ -3634,7 +3816,7 @@
             if (state.activeRequestPreview !== overlay) return;
             const messages = buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
-                cards: state.settings.promptCards,
+                cards: defaultPromptCards(),
             });
             const size = messages.reduce((total, message) => total + message.content.length, 0);
             summary.textContent = [
@@ -4635,7 +4817,7 @@
             config,
             messages: buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
-                cards: resolvePromptCards(state.settings, actionInput),
+                cards: resolvePromptCards(actionInput),
             }),
         };
         const dialog = createReviewDialog(action, scope, request.messages);
@@ -4969,7 +5151,13 @@
             state.settings.lastCustomMode = mode;
             saveSettings();
             session.oneOffInstruction = instruction;
-            return { id: 'one-off', name: '臨時指令', icon: 'fa-comment-dots', instruction, mode };
+            // ⚠️ Built from the resolved builtin, not from a literal. 臨時指令 is a builtin
+            // as of 0.10.0 and carries its own prompt cards; a hand-written object here
+            // would drop them, and the request would go out with the factory cards while
+            // the settings dialog showed the edited ones. Only 指示 and 編輯模式 come from
+            // this form — everything else is the command's own configuration.
+            const preset = resolveCommands(state.settings).builtins.find(command => command.id === 'one-off');
+            return { ...preset, instruction, mode };
         });
     }
 
@@ -5298,8 +5486,9 @@
         });
     }
 
-    // Draws the card list and hands back a fresh array on every change. Used inline by
-    // the 提示詞設定 tab and inside a dialog by the command form, so both views of the
+    // Draws the card list and hands back a fresh array on every change. Since 0.10.0 the
+    // only caller is the command form's dialog — the 提示詞設定 tab that used to render it
+    // inline is gone (ADR-0008), so both views of the
     // same idea are literally the same code.
     //
     // ⚠️ The drop indicator only ever changes colour — it always occupies its space. An
@@ -5505,43 +5694,53 @@
             modeField.append(mode);
             row.append(iconField, modeField);
 
+            // 臨時指令 is the one command whose 指示 arrives from its own dialog every time
+            // it runs, so here the field has nothing to hold and must not be required —
+            // required would make the form unsubmittable and its prompt cards unreachable.
+            const isOneOff = command.id === 'one-off';
             const instructionField = createElement('div', 'stiae-field');
             instructionField.append(createElement('label', '', '指示'));
             const instruction = createElement('textarea');
             instruction.name = 'instruction';
-            instruction.required = true;
+            instruction.required = !isOneOff;
+            instruction.disabled = isOneOff;
             instruction.value = command.instruction;
             instructionField.append(instruction);
+            if (isOneOff) {
+                instruction.placeholder = '（臨時指令的指示每次按下去的時候自己打）';
+                instructionField.append(createElement('div', 'stiae-help', '這條指令沒有固定的指示——你每次按「臨時指令」時打的字就是它的指示。這裡能改的是它的提示詞模組。'));
+            }
 
             // Held in the closure rather than in a form field: it is a list, not a value.
-            // null means 跟隨全域 — the command has no list of its own (ADR-0007).
+            // null means the cards have never been edited, so this command sends a copy
+            // of the factory arrangement (ADR-0008).
             const cardsField = createElement('div', 'stiae-field');
             cardsField.append(createElement('label', '', '提示詞模組'));
             const cardsStatus = createElement('div', 'stiae-help');
             const cardsRow = createElement('div', 'stiae-command-row-actions');
             const editCards = button('編輯這條指令的模組', 'fa-layer-group');
-            const resetCards = button('改回跟著設定走', 'fa-rotate-left');
+            const resetCards = button('還原成預設', 'fa-rotate-left');
             cardsRow.append(editCards, resetCards);
             cardsField.append(cardsStatus, cardsRow);
             const paintCards = () => {
                 const own = Array.isArray(command.promptCards);
                 cardsStatus.textContent = own
-                    ? `專屬的 · 這條指令有自己的 ${command.promptCards.filter(card => card.kind === 'user').length} 個模組，之後改「提示詞設定」不會影響到它`
-                    : '跟著設定走 · 用「提示詞設定」那一份。你第一次動它的時候，才會複製一份專屬的給這條指令';
+                    ? `已改過 · 這條指令有自己的 ${command.promptCards.filter(card => card.kind === 'user').length} 個模組。升級換掉出廠內容時不會動到它`
+                    : '出廠內容 · 還沒動過，用的是這條指令的出廠模組。第一次編輯才會存成它自己的一份';
                 resetCards.disabled = !own;
             };
             editCards.addEventListener('click', async () => {
                 // The copy happens here, at the first edit — not when the command is
-                // created. A command nobody has had a reason to change keeps following
-                // the global list, so one edit there reaches all of them.
-                const working = clone(resolvePromptCards(state.settings, command));
+                // created. Until then the command stores nothing and sends the factory
+                // cards, which is what lets a later release fix a wrong word in them.
+                const working = clone(resolvePromptCards(command));
                 const changed = await showPromptCardsDialog(`「${name.value.trim() || command.name}」的提示詞模組`, working);
                 if (!changed) return;
                 command.promptCards = changed;
                 paintCards();
             });
             resetCards.addEventListener('click', async () => {
-                if (!await showConfirm('改回跟著設定走嗎？這條指令自己那一份模組會被丟掉。', { confirmLabel: '改回去', danger: true })) return;
+                if (!await showConfirm('還原成預設嗎？這條指令自己那一份模組會被丟掉，換回出廠內容。', { confirmLabel: '還原', danger: true })) return;
                 command.promptCards = null;
                 paintCards();
             });
@@ -5564,8 +5763,11 @@
             hostWindow.setTimeout(() => name.focus(), 0);
         }, form => {
             const name = form.elements.name.value.trim();
-            const instruction = form.elements.instruction.value.trim();
-            if (!name || !instruction) return undefined;
+            // ⚠️ Disabled fields are absent from form.elements in some browsers, so this
+            // reads through optional chaining. 臨時指令 legitimately has no instruction —
+            // refusing to save it here would make its prompt cards impossible to edit.
+            const instruction = String(form.elements.instruction?.value ?? command.instruction).trim();
+            if (!name || (!instruction && command.id !== 'one-off')) return undefined;
             return normalizeCommand({
                 ...command,
                 name,
@@ -5581,7 +5783,8 @@
     }
 
     // The card list as a dialog, for the command form. Resolves to the edited array, or
-    // null if the user backed out — so 跟隨全域 survives an accidental click on 編輯.
+    // null if the user backed out — so an accidental click on 編輯 does not freeze a copy
+    // onto a command that was still sending the factory cards.
     function showPromptCardsDialog(title, cards) {
         return showSimpleForm(title, form => {
             form.append(createElement(
@@ -5669,10 +5872,11 @@
     // opened — landing spots move out from under the pointer mid-drag, which this project
     // has already shipped once and had to undo. Tabs also keep the promise that there is
     // only ever one scrolling area on screen.
+    // ⚠️ 0.10.0 dropped the 提示詞設定 tab. Prompt cards belong to the command that sends
+    // them, so they are edited in that command's own form (ADR-0008).
     const SETTINGS_TABS = [
         ['api', 'API 設定', 'fa-plug'],
         ['commands', '指令設定', 'fa-wand-magic-sparkles'],
-        ['prompt', '提示詞設定', 'fa-layer-group'],
         ['about', '版本與備份', 'fa-clock-rotate-left'],
     ];
 
@@ -5768,26 +5972,14 @@
             addApiConfig,
         );
 
-        // ── 提示詞設定 ────────────────────────────────────────────
-        const cardList = createElement('div', 'stiae-command-list');
-        const addCard = button('新增模組', 'fa-plus');
-        const redrawCards = () => renderPromptCardList(cardList, draft.promptCards, cards => { draft.promptCards = cards; });
-        addCard.addEventListener('click', async () => {
-            const card = await showPromptCardForm(null);
-            if (!card) return;
-            draft.promptCards.splice(Math.max(draft.promptCards.length - 1, 1), 0, card);
-            redrawCards();
-        });
-        redrawCards();
-        panes.prompt.append(
-            createElement('div', 'stiae-field-label', '提示詞模組'),
-            createElement('div', 'stiae-help', '由上往下就是送給 AI 的順序。你可以新增自己的模組、調整順序，或暫時把某一段關起來。'),
-            createElement('div', 'stiae-help', '🔒 頭尾兩個鎖住不能動：最上面那段在教 AI 用什麼格式回話，最下面那段是要編修的正文——放最後才不會讓 AI 搞混哪一段才是要改的。'),
-            createElement('div', 'stiae-help', '⚙️ 這幾個的內容是你按下指令的當下工具自動填進去的，改不了，但位置可以調。'),
-            cardList,
-            addCard,
-            createElement('div', 'stiae-help', '這一份是所有指令共用的。除非某條指令自己動過模組（那時它會有一份專屬的），否則改這裡就等於改全部。'),
-        );
+        // ⚠️ 0.10.0 removed the 提示詞設定 pane along with the global list it edited
+        // (ADR-0008). Do not bring it back as a "template you can edit": the factory
+        // arrangement has to be a constant, because normalizeCommand() is a pure function
+        // that cannot see settings, and both new commands and imported command codes go
+        // through it. An editable template would also reopen exactly what ADR-0007
+        // objected to — a setting that changes nothing you already have.
+        //
+        // Prompt cards are edited where they are sent from: each command's own form.
 
         const builtinHeader = createElement('div', 'stiae-field-label', '內建指令');
         const builtinList = createElement('div', 'stiae-command-list');
@@ -5806,22 +5998,28 @@
                 const icon = createElement('i', `fa-solid ${command.icon}`);
                 const name = createElement('div');
                 name.append(createElement('strong', '', command.name));
-                const marks = [command.mode === 'patch' ? '局部修補' : '全文改寫'];
-                if (!command.visible) marks.push('已隱藏');
+                // 臨時指令 has its own button and takes its 指示 and 編輯模式 from the
+                // dialog each time, so neither the mode label nor the eye toggle means
+                // anything for it — an eye that hides nothing is worse than no eye.
+                const oneOff = command.id === 'one-off';
+                const marks = [oneOff ? '指示與模式每次自己選' : (command.mode === 'patch' ? '局部修補' : '全文改寫')];
+                if (!oneOff && !command.visible) marks.push('已隱藏');
                 marks.push(command.modified ? '已修改' : '出廠狀態');
                 name.append(createElement('div', 'stiae-help', marks.join(' · ')));
                 const actions = createElement('div', 'stiae-command-row-actions');
-                const toggle = button('', command.visible ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
-                toggle.title = command.visible ? '從指令列隱藏' : '顯示在指令列';
+                const toggle = oneOff ? null : button('', command.visible ? 'fa-eye' : 'fa-eye-slash', 'stiae-icon-button');
+                if (toggle) toggle.title = command.visible ? '從指令列隱藏' : '顯示在指令列';
                 const edit = button('', 'fa-pen', 'stiae-icon-button');
                 edit.title = '編輯';
                 const reset = button('', 'fa-rotate-left', 'stiae-icon-button');
                 reset.title = command.modified ? '還原預設' : '目前就是出廠內容';
                 reset.disabled = !command.modified;
-                toggle.addEventListener('click', () => {
-                    draft.builtinOverrides[command.id] = { ...command, visible: !command.visible };
-                    renderBuiltins();
-                });
+                if (toggle) {
+                    toggle.addEventListener('click', () => {
+                        draft.builtinOverrides[command.id] = { ...command, visible: !command.visible };
+                        renderBuiltins();
+                    });
+                }
                 edit.addEventListener('click', async () => {
                     const updated = await showCommandForm(command, true);
                     if (updated) {
@@ -5835,7 +6033,7 @@
                         renderBuiltins();
                     }
                 });
-                actions.append(toggle, edit, reset);
+                actions.append(...[toggle, edit, reset].filter(Boolean));
                 row.append(icon, name, actions);
                 builtinList.append(row);
             }
