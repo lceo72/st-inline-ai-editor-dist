@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.10.0';
+    const VERSION = '0.10.1';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -85,10 +85,25 @@
     // Three slots whose text is produced at send time. The user can drag them and, for
     // 參考資料, watch them fall away when there is nothing to put in them — but the words
     // are not theirs to edit, and neither is the position of the two pinned ones.
+    // ⚠️ 0.10.1 removed the 指示 slot. For every command except 臨時指令 the instruction is
+    // no longer something the tool fills in — it is a plain user card the author writes,
+    // tags `task` and places. The only sentence the tool still supplies is the range
+    // statement, and that rides on 目標內文, the card that was already about range.
+    //
+    // 臨時指令 is the exception, and it is the reason `oneOff` below exists: its words come
+    // from a dialog at send time, which is the definition of a system card.
     const SYSTEM_CARD_SLOTS = {
-        instruction: { name: '指示', help: '你按下的那個指令，要 AI 做什麼。' },
         reference: { name: '參考資料', help: '你在編輯器裡勾的參考樓層與世界書。一條都沒勾時整段不送出。' },
-        target: { name: '目標內文', help: '要編修的那一段文字。有帶參考資料時，結尾會自動再講一次你的指令，免得被前面一大段蓋過去。' },
+        target: { name: '目標內文', help: '要編修的那一段文字，開頭會說明可以改的範圍是哪一段、誰寫的。它永遠釘在最後，這樣參考資料就不會排到要改的正文後面。' },
+        // ⚠️ optional means "never grown back automatically". Every other slot is refilled
+        // when a stored list has lost it, because a request without 參考資料 or 目標內文 is
+        // broken. This one belongs to 臨時指令 alone — refilling it would put an empty,
+        // unexplainable card into all five other commands.
+        oneOff: {
+            name: '這次要做什麼',
+            help: '你按下「臨時指令」時打的那段字。只有臨時指令有這一格，內容每次現填，不會存起來。',
+            optional: true,
+        },
     };
 
     // ⚠️ Both pinned cards exist because this tool's output travels back to be matched
@@ -98,6 +113,10 @@
     // one arrangement that reliably goes wrong — impossible to express.
     const PINNED_FIRST = 'protocol';
     const PINNED_LAST = 'target';
+
+    // 臨時指令's id, referenced from enough places that a typo would be a silent bug: the
+    // toolbar filter, the settings row, the card resolver and the dialog all key off it.
+    const ONE_OFF_ID = 'one-off';
 
     // Half-width, unlike the wrapper marks in MARK. A tag the user writes is read by the
     // model as structure, and half-width is the form it has seen countless times. The
@@ -136,7 +155,17 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.10.0
+    const CHANGELOG = `0.10.1
+- **「指示」不再是一個獨立的輸入框，它就是一張普通的模組。** 指令表單裡那一格沒了；要寫「請 AI 做什麼」，就在這條指令的模組清單裡寫一張——出廠已經幫你放好一張叫「指示」的，標籤填 \`task\`。
+- 它跟其他模組沒有任何差別：可改、可關、可刪、可拖，也可以放好幾張。**沒有另外的開關要勾**——標籤 \`task\` 已經對 AI 說了這是任務。
+- **模組清單可以點開看內容了**，鎖住的協定與目標內文也看得到。要改仍然是按右邊的鉛筆。
+- **臨時指令多了一格「這次要做什麼」**：你在對話框打的字會落在那裡。它跟目標內文一樣不能編輯也不能刪（內容每次現填、用完就丟），但位置可以拖。只有臨時指令有這一格。
+- 「可以改的範圍是哪一段、誰寫的」那句話搬到目標內文的開頭——它本來就是在講範圍，跟指示放在一起沒有道理。
+- **正文結尾那句 \`Reminder — your task:\` 拿掉了。** 它當初存在的唯一理由是「指示跟正文之間隔著一大段參考資料」，而 0.10.0 把參考資料移到指示前面之後，那個理由就沒了——留著只是同一句話連講兩遍、中間什麼都沒有。真的想講兩次，現在自己放兩張指示模組就行。
+- 一條指令如果所有模組都空著或被關掉，它不會出現在指令列；打開它的編輯表單會有一行紅字講明原因。
+- ⚠️ **升級後每條指令都會標成「已改過」。** 你原本填在「指示」欄的字被搬進模組裡了，資料形狀變了就沒辦法再算「沒動過」。位置不變，送出的內容只差在那句重述沒了。
+
+0.10.0
 - **提示詞模組不再有「全域一份」這回事。** 每條指令送出的模組清單就是它自己的，設定視窗的「提示詞設定」分頁已移除。
 - 出廠內容改成**每條指令各自帶一份**，四個內建指令因此可以有不一樣的角色宣告——潤飾要找的是壞掉的句子，重寫是整段重新生成，一份共用的宣告必須寫得夠空才涵蓋得了兩者，而夠空就等於沒說。
 - 內建指令的指示全部換新，出廠模組改成「角色宣告 + 思考流程」兩張。沒動過的指令會直接拿到新版；動過的維持你自己那份（跟以前一樣不會被升級碰到）。
@@ -187,10 +216,6 @@
 - 魔杖從 ⋯ 選單拉到樓層動作列上，少按一次。
 - 修正窄螢幕上「查看整個樓層的修改位置」排版錯亂。
 
-0.6.0
-- 差異視窗每一個有變更的行都能個別勾選要不要採用，預設全勾。
-- 局部修補與全文改寫都適用。
-
 `;
 
     // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
@@ -236,7 +261,7 @@
             name: '重寫',
             icon: 'fa-pen',
             mode: 'replacement',
-            instruction: [
+            factoryInstruction: [
                 'Write this passage again. What happens inside it can be rearranged, and the original wording does not have to survive.',
                 '',
                 'What cannot change is the state at each end: where people are, who is present and what has just happened at the start; where the story stands and what state each character is in at the finish. The next message follows on from here, and a seam that does not join is a failure.',
@@ -255,7 +280,7 @@
             // are still working in order to hit it, and that failure is written back into
             // the manuscript. "Work through the ones you found and stop there" is a
             // completion condition instead — how long the list is, the passage decides.
-            instruction: [
+            factoryInstruction: [
                 'Tighten this passage without losing a single piece of information.',
                 'Targets: the same thing said twice, modifiers that carry nothing, scenery and expressions dwelt on past their use, one action broken into several smaller ones.',
                 'Work through the ones you found and stop there. Do not cut words that are still doing something just to show progress.',
@@ -270,7 +295,7 @@
             // ⚠️ This names targets, not techniques. 0.9.x said "expand with sensory
             // detail, action, or beats" — naming a technique got stacked adjectives back.
             // Say where the passage is thin and the model picks the technique itself.
-            instruction: [
+            factoryInstruction: [
                 'Find where the passage moves too fast, where a reaction is owed and not given, where a key action is covered in a single line. Those are the places you fill in.',
                 'Do not pad the length with stacked modifiers and sensory detail. Everything you add is something the reader was already waiting for.',
                 'Character intent stays as it is, event order stays as it is, and nothing happens that did not happen before.',
@@ -283,22 +308,23 @@
             mode: 'patch',
             // The last sentence is the line between this and 重寫. Without it the two
             // buttons do the same job.
-            instruction: [
+            factoryInstruction: [
                 'Fix what is broken: grammar, punctuation, wrong characters, imprecise word choice, sentences that stumble.',
                 'Leave sound sentences untouched. This task does not touch content, pacing, or matters of taste.',
             ].join('\n'),
         },
         {
-            // 臨時指令. A builtin like the other four — it has its own card list, can be
-            // edited, can be reset — except the 指示 arrives from the dialog each time
-            // instead of being stored. The blank instruction is what keeps it off the
-            // toolbar (the toolbar only draws commands whose instruction is non-empty);
-            // it has its own button next to them.
-            id: 'one-off',
+            // 臨時指令. A builtin like the other four — its own card list, editable,
+            // resettable — except that where they have a 指示 card the author writes, it
+            // has an uneditable system card the dialog fills at send time.
+            //
+            // It stays off the toolbar by id (commandIsDrawable); it has its own button
+            // next to them.
+            id: ONE_OFF_ID,
             name: '臨時指令',
             icon: 'fa-comment-dots',
             mode: 'patch',
-            instruction: '',
+            promptCards: null, // filled from oneOffPromptCards() — see resolvePromptCards
         },
     ];
 
@@ -382,7 +408,9 @@
             // never mixed into the custom list (ADR-0001).
             group: String(command?.group || '').trim(),
             icon: ICONS.some(([value]) => value === command?.icon) ? command.icon : ICONS[0][0],
-            instruction: String(command?.instruction || ''),
+            // ⚠️ 0.10.1 removed the instruction field. It is read here one last time and
+            // turned into a 指示 card (migrateInstructionToCard) — after that the words
+            // live in the card list like everything else the model is told.
             mode: command?.mode === 'replacement' ? 'replacement' : 'patch',
             // Which API 設定 this command uses. Empty means the default one.
             //
@@ -401,9 +429,7 @@
             //
             // carriedCards is 0.9.x's customised global list during the one migration
             // that needs it, and null every other time.
-            promptCards: Array.isArray(command?.promptCards)
-                ? normalizePromptCards(command.promptCards)
-                : (migrateSystemPromptToCards(command?.systemPrompt) ?? (carriedCards ? clone(normalizePromptCards(carriedCards)) : null)),
+            promptCards: resolveStoredCards(command, carriedCards),
             visible: command?.visible !== false,
         };
     }
@@ -425,6 +451,68 @@
             { kind: 'system', slot: 'reference' },
             { kind: 'system', slot: 'target' },
         ]);
+    }
+
+    // What a command stores, after every migration that might apply. null still means
+    // "never edited, send the factory cards" (ADR-0008).
+    //
+    // ⚠️ 0.10.1's migration is the one that cannot preserve that null. The instruction
+    // used to be a field beside the card list; now it is a card inside it, so any command
+    // that had instruction text has to grow a list of its own to hold it — every command
+    // comes out of this upgrade marked 已改過. The bytes it sends do not change; where
+    // they are stored does.
+    function resolveStoredCards(command, carriedCards) {
+        const stored = Array.isArray(command?.promptCards)
+            ? command.promptCards
+            : (migrateSystemPromptToCards(command?.systemPrompt) ?? (carriedCards ? clone(normalizePromptCards(carriedCards)) : null));
+        const text = String(command?.instruction || '').trim();
+        if (!text) return stored === null ? null : normalizePromptCards(stored);
+        // A command with instruction text but no list of its own: build one from the
+        // factory arrangement so the 指示 card lands where the 指示 slot used to be.
+        if (stored === null) return defaultPromptCards(text);
+        return normalizePromptCards(migrateInstructionToCard(stored, text));
+    }
+
+    // Puts the old instruction text into a card, in the slot the 指示 system card used to
+    // occupy — the position is what keeps the assembled order identical.
+    //
+    // ⚠️ It works on the RAW list, before normalizePromptCards. 指示 is no longer a valid
+    // system slot, so normalization drops that entry; substituting afterwards would put
+    // the card in the wrong place, and the only symptom would be the task drifting to a
+    // different spot in the request.
+    function migrateInstructionToCard(rawCards, text) {
+        const source = Array.isArray(rawCards) ? rawCards : [];
+        if (source.some(card => card?.kind === 'user' && String(card?.tag) === 'task')) return source;
+        const card = { kind: 'user', name: '指示', content: text, role: 'user', tag: 'task' };
+        const at = source.findIndex(entry => entry?.kind === 'system' && entry?.slot === 'instruction');
+        if (at === -1) return [...source, card];
+        return [...source.slice(0, at), card, ...source.slice(at + 1)];
+    }
+
+    // Everything a command actually says, in list order. Switched-off and emptied cards
+    // are skipped, exactly as they are when the prompt is assembled.
+    //
+    // ⚠️ There is no "this one is the instruction" mark. A card that tells the model what
+    // to do is an ordinary user card — the author writes it, tags it (出廠 uses `task`),
+    // places it, and can have as many as they like. The only thing the tool needs to know
+    // is whether the command says anything at all.
+    function collectUserCardText(cards) {
+        return (Array.isArray(cards) ? cards : [])
+            .filter(card => card?.kind === 'user' && card.enabled !== false)
+            .map(card => String(card.content ?? '').trim())
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    // Whether the toolbar draws a button for this command. It replaces 0.10.0's
+    // `instruction.trim()` check and keeps that check's one useful side effect: a command
+    // with nothing to say does not get a button.
+    //
+    // ⚠️ 臨時指令 is excluded by id, not by emptiness. Its words arrive from its own dialog
+    // and it has its own button on the toolbar — drawing it here would put it there twice.
+    function commandIsDrawable(command) {
+        if (command?.id === ONE_OFF_ID) return false;
+        return Boolean(collectUserCardText(resolvePromptCards(command)));
     }
 
     // A tag turns a user card into `<name>…</name>`. Angle brackets and whitespace are
@@ -475,13 +563,35 @@
     // Every call returns fresh objects (makeId per card). Do not memoise this: two
     // commands holding the same array would edit each other, and the list is spliced in
     // place by the card dialog.
-    function defaultPromptCards() {
+    // instructionText fills the 指示 card — an ordinary user card, tagged `task`, sitting
+    // where the retired 指示 slot used to. Empty text still ships the card: an author who
+    // opens a fresh command finds the place their words belong, already in position.
+    function defaultPromptCards(instructionText = '') {
         return normalizePromptCards([
             { kind: 'protocol' },
             { kind: 'user', name: '角色宣告', content: DEFAULT_ROLE_CARD, role: 'system', tag: 'role' },
             { kind: 'user', name: '思考流程', content: DEFAULT_METHOD_CARD, role: 'system', tag: 'method' },
             { kind: 'system', slot: 'reference' },
-            { kind: 'system', slot: 'instruction' },
+            { kind: 'user', name: '指示', content: String(instructionText || '').trim(), role: 'user', tag: 'task' },
+            { kind: 'system', slot: 'target' },
+        ]);
+    }
+
+    // 臨時指令's arrangement. Where every other command has a 指示 card the author writes,
+    // this one has a system card the tool fills at send time — the same relationship
+    // 目標內文 has with the prose. It cannot be edited, because there is nothing stable to
+    // edit: the words are different every time and are never stored.
+    //
+    // ⚠️ The slot is marked optional in SYSTEM_CARD_SLOTS so normalizePromptCards never
+    // grows one back into the other five commands. If it did, they would each carry an
+    // uneditable card that is always empty and can never be explained.
+    function oneOffPromptCards() {
+        return normalizePromptCards([
+            { kind: 'protocol' },
+            { kind: 'user', name: '角色宣告', content: DEFAULT_ROLE_CARD, role: 'system', tag: 'role' },
+            { kind: 'user', name: '思考流程', content: DEFAULT_METHOD_CARD, role: 'system', tag: 'method' },
+            { kind: 'system', slot: 'reference' },
+            { kind: 'system', slot: 'oneOff' },
             { kind: 'system', slot: 'target' },
         ]);
     }
@@ -511,8 +621,8 @@
         // A generated card the stored list has lost is appended rather than dropped. It
         // carries text the request cannot do without, and losing 指示 silently would send
         // the model prose with no task attached.
-        for (const slot of Object.keys(SYSTEM_CARD_SLOTS)) {
-            if (slot === PINNED_LAST || seenSlots.has(slot)) continue;
+        for (const [slot, meta] of Object.entries(SYSTEM_CARD_SLOTS)) {
+            if (slot === PINNED_LAST || seenSlots.has(slot) || meta.optional) continue;
             middle.push({ id: `system-${slot}`, kind: 'system', slot });
         }
         return [
@@ -538,10 +648,13 @@
     function resolvePromptCards(command) {
         const own = command?.promptCards;
         if (Array.isArray(own)) return normalizePromptCards(own);
+        if (command?.id === ONE_OFF_ID) return oneOffPromptCards();
         const builtin = BUILTIN_ACTIONS.find(action => action.id === command?.id);
-        return Array.isArray(builtin?.promptCards)
-            ? normalizePromptCards(builtin.promptCards)
-            : defaultPromptCards();
+        if (Array.isArray(builtin?.promptCards)) return normalizePromptCards(builtin.promptCards);
+        // The factory instruction is assembled here rather than stored on the preset, so
+        // every call still hands back fresh objects — two commands holding one array
+        // would edit each other through the card dialog's in-place splice.
+        return defaultPromptCards(builtin?.factoryInstruction);
     }
 
     // One connection the tool talks to. Everything a request needs is in here, including
@@ -1683,8 +1796,10 @@
     function renderPromptCard(card, parts) {
         if (card.kind === 'protocol') return { role: 'system', content: parts.protocol };
         if (card.kind === 'system') {
-            if (card.slot === 'instruction') return { role: 'user', content: parts.instruction };
             if (card.slot === 'reference') return parts.reference ? { role: 'user', content: parts.reference } : null;
+            // Empty behaves like 參考資料 with nothing ticked: the card contributes nothing
+            // rather than an empty <task> block for the model to puzzle over.
+            if (card.slot === 'oneOff') return parts.oneOff ? { role: 'user', content: parts.oneOff } : null;
             return { role: 'user', content: parts.target };
         }
         if (card.enabled === false) return null;
@@ -1724,7 +1839,10 @@
     function buildPrompt(action, scope, role, options = {}) {
         const reference = String(options.referenceBlock ?? '').trim();
         const cards = normalizePromptCards(options.cards);
-        const instruction = action.instruction.trim();
+        // 0.10.1: the instruction is whatever the author marked 這是指示, and it is carried
+        // by those cards themselves — buildPrompt no longer has to place it anywhere. A
+        // command with none still assembles and still sends; it just never asks for
+        // anything, which is why the toolbar does not draw one (commandIsDrawable).
         const scopeLabel = scope.hasSelection ? 'a selected passage' : 'the whole message';
         const contextBlocks = scope.hasSelection
             ? [
@@ -1741,21 +1859,33 @@
                 scope.text,
                 MARK.fullScopeClose,
             ];
+        // 臨時指令's words, wrapped the same way the factory 指示 card is — the model sees
+        // one shape whichever command was pressed.
+        const oneOffText = String(options.oneOffInstruction ?? '').trim();
         const parts = {
             protocol: reference && action.mode === 'patch'
                 ? `${LOCKED_PROTOCOL.patch}\n${PATCH_REFERENCE_RULE}`
                 : LOCKED_PROTOCOL[action.mode],
-            instruction: [
-                `Task: ${instruction}`,
-                `The editable scope is ${scopeLabel} written by the ${role}.`,
-            ].join('\n'),
             reference,
-            // The reminder rides on the pinned last card rather than being a card of its
-            // own. It is a restatement of Task:, and its only reason to exist is that a
-            // long stretch of reference material sits between the two — a draggable card
-            // could be dropped right under 指示, saying the same sentence twice with
-            // nothing in between (ADR-0006).
-            target: contextBlocks.join('\n') + (reference ? `\n\nReminder — your task: ${instruction}` : ''),
+            oneOff: oneOffText ? `<task>\n${oneOffText}\n</task>` : '',
+            // 目標內文 carries the range statement and then the prose. The statement says
+            // which stretch may be changed and who wrote it — the tool's answer, not the
+            // author's — and it belongs here because this card is the one that wraps that
+            // stretch in markers. Keeping the two apart is what would let them drift.
+            //
+            // ⚠️ The `Reminder — your task:` restatement is gone as of 0.10.1. ADR-0006
+            // gave it exactly one reason to exist: a long stretch of reference material
+            // sitting between the task and the prose. 0.10.0 moved 參考資料 in front of
+            // 指示, which put the task next to the prose and left the restatement saying
+            // the same sentence twice with nothing in between — the very arrangement
+            // ADR-0006 refused to let anyone drag into being.
+            //
+            // Anyone who does want it twice can say so directly now: 指示 is a card, and
+            // there can be more than one.
+            target: [
+                `The editable scope is ${scopeLabel} written by the ${role}.`,
+                contextBlocks.join('\n'),
+            ].join('\n'),
         };
         return mergePromptMessages(cards.map(card => renderPromptCard(card, parts)));
     }
@@ -1844,6 +1974,9 @@
 
     const TEST_API = {
         normalizeSettings,
+        normalizeCommand,
+        collectUserCardText,
+        commandIsDrawable,
         normalizeBuiltinOverrides,
         sortCommandsByGroup,
         commandGroupNames,
@@ -2294,6 +2427,23 @@
             .stiae-card-system > i { color: var(--stiae-muted); }
             .stiae-card-locked { border-left: 3px solid var(--stiae-border); background: rgba(127,127,127,.18); }
             .stiae-card-locked > i, .stiae-card-locked strong { color: var(--stiae-muted); }
+            /* Every row opens, including the locked pair — reading a card is not editing
+               it, and the two cards you cannot edit are the two nobody could read. */
+            .stiae-command-row { cursor: pointer; }
+            .stiae-card-caret { color: var(--stiae-muted); font-size: 11px; transition: transform .12s; }
+            .stiae-card-caret-open { transform: rotate(90deg); }
+            .stiae-card-preview {
+                margin: -4px 0 8px 0; padding: 10px 12px;
+                border: 1px solid var(--stiae-border); border-top: 0;
+                border-radius: 0 0 6px 6px;
+                background: rgba(127,127,127,.09);
+                color: var(--stiae-muted);
+                font-size: 12px; line-height: 1.5;
+                /* The content is prose with meaningful line breaks; wrap it rather than
+                   letting a long protocol line push a horizontal scrollbar under it. */
+                white-space: pre-wrap; word-break: break-word;
+                max-height: 260px; overflow-y: auto;
+            }
             /* A switched-off card is still yours — it keeps its colour and loses its
                presence, so "off" never reads as "locked". */
             .stiae-card-off { opacity: .5; }
@@ -3740,10 +3890,10 @@
         return side;
     }
 
-    // The instruction is the one slot that is purely a variable: it lands at the top of
-    // the user message as `Task: …` and, when there is reference material, again at the
-    // bottom as the reminder. Both positions are the same whichever command is pressed,
-    // so a marker stands in for it.
+    // The preview stands in for a command nobody has pressed yet, so the 指示 card gets a
+    // marker instead of words. 0.10.1 note: the position is no longer fixed — every
+    // command places its own 指示 cards — so this shows where the factory arrangement puts
+    // one, and the line under the two mode buttons says as much.
     const PREVIEW_INSTRUCTION = '〔這裡會換成你按下的那個指令的指示〕';
 
     // What this request looks like before any command is pressed — built by the same
@@ -3784,7 +3934,7 @@
         const modeHelp = createElement(
             'div',
             'stiae-help',
-            '不論按哪個指令，你的要求都會落在同一個位置，所以這裡先用一段假的代替。但「局部修補」和「全文改寫」教 AI 回話的方式完全不同，想看哪一種請自己切。這裡的模組是出廠內容；每條指令的模組都是它自己的，動過的那幾條實際送出的會是它們自己那一份。',
+            '這裡畫的是出廠內容：〔…〕那一格就是「指示」模組的位置，按下真的指令時換成它自己的字。每條指令的模組都是它自己的一份，位置也可以自己排——動過的那幾條實際送出的會跟這裡不一樣。「局部修補」和「全文改寫」教 AI 回話的方式完全不同，想看哪一種請自己切。',
         );
         const summary = createElement('div', 'stiae-help');
         const content = createElement('div', 'stiae-preview-rows');
@@ -3809,19 +3959,24 @@
             // mode. There is no global list to show any more (ADR-0008), so this shows the
             // factory cards — every command starts from them, and the ones that have been
             // edited send their own. The note under the two buttons says so.
-            const action = { instruction: PREVIEW_INSTRUCTION, mode };
+            const action = { mode };
             const scope = scopeFromTextarea(session.textarea);
             summary.textContent = '正在組裝…';
             const reference = await refreshReference(session);
             if (state.activeRequestPreview !== overlay) return;
             const messages = buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
-                cards: defaultPromptCards(),
+                // 0.10.1: the placeholder rides inside the 指示 card rather than being a
+                // separate argument — that is where a real command's instruction lives.
+                cards: defaultPromptCards(PREVIEW_INSTRUCTION),
             });
             const size = messages.reduce((total, message) => total + message.content.length, 0);
+            // ⚠️ 0.10.1 dropped "不含指示本身". The instruction is a card now, so it is
+            // inside this count — a note saying otherwise would be quietly wrong.
             summary.textContent = [
-                `${size.toLocaleString('en-US')} 字元（不含指示本身）`,
+                `${size.toLocaleString('en-US')} 字元`,
                 scope.hasSelection ? `可編輯範圍＝反白的 ${scope.end - scope.start} 個字元` : '可編輯範圍＝整個樓層',
+                reference.block ? '有帶參考資料' : '沒帶參考資料',
             ].join(' · ');
             plain = messages.map(message => `${message.role}:\n${message.content}`).join('\n\n');
             content.replaceChildren();
@@ -3978,13 +4133,13 @@
         toolbar.replaceChildren();
 
         const { builtins, customs } = resolveCommands(state.settings);
-        for (const action of builtins.filter(command => command.visible && command.instruction.trim())) {
+        for (const action of builtins.filter(command => command.visible && commandIsDrawable(command))) {
             const item = button(action.name, action.icon);
             item.addEventListener('click', () => runAiAction(session, action));
             toolbar.append(item);
         }
 
-        const visibleCommands = customs.filter(command => command.visible && command.instruction.trim());
+        const visibleCommands = customs.filter(command => command.visible && commandIsDrawable(command));
 
         // A group is a folder button on the toolbar, not a heading buried inside ⋯.
         // 0.7.0 first shipped it as headings in the ⋯ menu and it was invisible in
@@ -4818,6 +4973,8 @@
             messages: buildPrompt(action, scope, session.role, {
                 referenceBlock: reference.block,
                 cards: resolvePromptCards(actionInput),
+                // Only 臨時指令 carries this; every other command's words are in its cards.
+                oneOffInstruction: actionInput.oneOffInstruction,
             }),
         };
         const dialog = createReviewDialog(action, scope, request.messages);
@@ -5152,12 +5309,15 @@
             saveSettings();
             session.oneOffInstruction = instruction;
             // ⚠️ Built from the resolved builtin, not from a literal. 臨時指令 is a builtin
-            // as of 0.10.0 and carries its own prompt cards; a hand-written object here
-            // would drop them, and the request would go out with the factory cards while
-            // the settings dialog showed the edited ones. Only 指示 and 編輯模式 come from
-            // this form — everything else is the command's own configuration.
-            const preset = resolveCommands(state.settings).builtins.find(command => command.id === 'one-off');
-            return { ...preset, instruction, mode };
+            // and carries its own prompt cards; a hand-written object here would drop them,
+            // and the request would go out with the factory cards while the settings dialog
+            // showed the edited ones.
+            //
+            // The typed words ride alongside as oneOffInstruction rather than being written
+            // into a card, because the card that holds them is a system card — its content
+            // is produced at send time, like 參考資料 and 目標內文. Nothing is stored.
+            const preset = resolveCommands(state.settings).builtins.find(command => command.id === ONE_OFF_ID);
+            return { ...preset, oneOffInstruction: instruction, mode };
         });
     }
 
@@ -5473,6 +5633,11 @@
             content.value = card.content;
             contentField.append(content);
 
+            // ⚠️ There is no "this one is the instruction" checkbox, deliberately. The
+            // words that tell the model what to do are an ordinary card; 出廠 tags one
+            // `task` and puts it next to the prose, and that tag is what says so to the
+            // model. A second mark saying the same thing is what we just removed the
+            // duplicated reminder for.
             form.append(nameField, row, contentField);
             hostWindow.setTimeout(() => name.focus(), 0);
         }, form => {
@@ -5495,7 +5660,50 @@
     // indicator that appears on dragstart pushes the list open under the pointer and
     // every landing spot moves, which makes dragging useless while every automated test
     // still passes (synthetic DragEvents never lay anything out).
-    function renderPromptCardList(container, cards, onChange) {
+    // What a row shows when you open it. The two generated cards have no text until the
+    // moment a request is built, so they show the shape they will take instead of a lie
+    // about their contents — the markers are real, what sits between them is not.
+    function promptCardPreview(card, mode) {
+        if (card.kind === 'protocol') return LOCKED_PROTOCOL[mode] || LOCKED_PROTOCOL.patch;
+        if (card.kind === 'system' && card.slot === 'reference') {
+            return [
+                '（這一格的內容是按下指令的當下才產生的，長這樣：）',
+                '',
+                MARK.referenceOpen,
+                '…你在側邊欄勾的參考樓層與世界書條目…',
+                MARK.referenceClose,
+                '',
+                '一條都沒勾的時候，這一格整個不送出。',
+            ].join('\n');
+        }
+        if (card.kind === 'system' && card.slot === 'oneOff') {
+            return [
+                '（這一格的內容是按下「臨時指令」的當下才產生的，長這樣：）',
+                '',
+                '<task>',
+                '…你在對話框裡打的那段字…',
+                '</task>',
+                '',
+                '只有臨時指令有這一格。打的字用完就丟，不會存起來，所以這一格沒得編輯——',
+                '就像目標內文那一格一樣，內容是工具填的。位置倒是可以拖。',
+            ].join('\n');
+        }
+        if (card.kind === 'system') {
+            return [
+                '（這一格的內容是按下指令的當下才產生的，長這樣：）',
+                '',
+                'The editable scope is the whole message written by the assistant.',
+                MARK.fullScopeOpen,
+                '…要編修的那一段文字…',
+                MARK.fullScopeClose,
+                '',
+                '反白了一段的話，會先附上整個樓層當背景，再單獨框出你反白的那一段。',
+            ].join('\n');
+        }
+        return card.content;
+    }
+
+    function renderPromptCardList(container, cards, onChange, mode = 'patch') {
         let dragFrom = null;
         const draw = () => {
             container.replaceChildren();
@@ -5555,7 +5763,21 @@
                     down.addEventListener('click', () => move(index, index + 1));
                     actions.append(up, down);
                 }
-                row.append(icon, label, actions);
+                const caret = createElement('i', 'fa-solid fa-chevron-right stiae-card-caret');
+                row.append(icon, label, actions, caret);
+
+                // Opening a row is how you read a card without opening the editor — and
+                // for the locked ones it is the only way. Editing still goes through the
+                // pencil: a row that edited on click would turn every glance into a change.
+                const preview = createElement('pre', 'stiae-card-preview');
+                preview.textContent = promptCardPreview(card, mode);
+                preview.hidden = true;
+                row.addEventListener('click', event => {
+                    // Buttons and the drag grip keep their own jobs.
+                    if (event.target.closest('button, .stiae-drag-grip')) return;
+                    preview.hidden = !preview.hidden;
+                    caret.classList.toggle('stiae-card-caret-open', !preview.hidden);
+                });
 
                 if (!pinned) {
                     row.addEventListener('dragstart', event => {
@@ -5588,7 +5810,7 @@
                     const rect = row.getBoundingClientRect();
                     move(dragFrom, event.clientY > rect.top + rect.height / 2 ? index + 1 : index);
                 });
-                container.append(row);
+                container.append(row, preview);
             });
         };
         // ⚠️ Clamped to the stretch between the two pinned cards. 協定 must stay first and
@@ -5694,22 +5916,10 @@
             modeField.append(mode);
             row.append(iconField, modeField);
 
-            // 臨時指令 is the one command whose 指示 arrives from its own dialog every time
-            // it runs, so here the field has nothing to hold and must not be required —
-            // required would make the form unsubmittable and its prompt cards unreachable.
+            // ⚠️ 0.10.1 removed the 指示 textarea. The instruction is a card now, written
+            // and placed in the card list like everything else the model is told — there
+            // is no field here to hold it.
             const isOneOff = command.id === 'one-off';
-            const instructionField = createElement('div', 'stiae-field');
-            instructionField.append(createElement('label', '', '指示'));
-            const instruction = createElement('textarea');
-            instruction.name = 'instruction';
-            instruction.required = !isOneOff;
-            instruction.disabled = isOneOff;
-            instruction.value = command.instruction;
-            instructionField.append(instruction);
-            if (isOneOff) {
-                instruction.placeholder = '（臨時指令的指示每次按下去的時候自己打）';
-                instructionField.append(createElement('div', 'stiae-help', '這條指令沒有固定的指示——你每次按「臨時指令」時打的字就是它的指示。這裡能改的是它的提示詞模組。'));
-            }
 
             // Held in the closure rather than in a form field: it is a list, not a value.
             // null means the cards have never been edited, so this command sends a copy
@@ -5717,16 +5927,24 @@
             const cardsField = createElement('div', 'stiae-field');
             cardsField.append(createElement('label', '', '提示詞模組'));
             const cardsStatus = createElement('div', 'stiae-help');
+            const cardsWarning = createElement('div', 'stiae-help');
             const cardsRow = createElement('div', 'stiae-command-row-actions');
             const editCards = button('編輯這條指令的模組', 'fa-layer-group');
             const resetCards = button('還原成預設', 'fa-rotate-left');
             cardsRow.append(editCards, resetCards);
-            cardsField.append(cardsStatus, cardsRow);
+            cardsField.append(cardsStatus, cardsWarning, cardsRow);
             const paintCards = () => {
                 const own = Array.isArray(command.promptCards);
                 cardsStatus.textContent = own
                     ? `已改過 · 這條指令有自己的 ${command.promptCards.filter(card => card.kind === 'user').length} 個模組。升級換掉出廠內容時不會動到它`
                     : '出廠內容 · 還沒動過，用的是這條指令的出廠模組。第一次編輯才會存成它自己的一份';
+                // ⚠️ A command with no 指示 card asks the model for nothing, and the toolbar
+                // will not draw it. Silently vanishing from the toolbar is exactly the kind
+                // of failure this project refuses, so it gets said here, where it is fixable.
+                const silent = !isOneOff && !collectUserCardText(resolvePromptCards(command));
+                cardsWarning.textContent = silent
+                    ? '⚠️ 這條指令的模組全是空的或被關掉了，所以它不會出現在工具列——AI 不會知道你要它做什麼。'
+                    : '';
                 resetCards.disabled = !own;
             };
             editCards.addEventListener('click', async () => {
@@ -5734,7 +5952,13 @@
                 // created. Until then the command stores nothing and sends the factory
                 // cards, which is what lets a later release fix a wrong word in them.
                 const working = clone(resolvePromptCards(command));
-                const changed = await showPromptCardsDialog(`「${name.value.trim() || command.name}」的提示詞模組`, working);
+                // The mode comes from the form, not from the stored command: the protocol
+                // preview has to match the mode the user is about to save.
+                const changed = await showPromptCardsDialog(
+                    `「${name.value.trim() || command.name}」的提示詞模組`,
+                    working,
+                    form.elements.mode.value,
+                );
                 if (!changed) return;
                 command.promptCards = changed;
                 paintCards();
@@ -5759,22 +5983,21 @@
             visible.type = 'checkbox';
             visible.checked = command.visible;
             visibleLabel.append(visible, createElement('span', '', '顯示在編輯器指令列'));
-            form.append(nameField, groupField, newGroupField, row, instructionField, cardsField, apiField, visibleLabel);
+            form.append(nameField, groupField, newGroupField, row, cardsField, apiField, visibleLabel);
             hostWindow.setTimeout(() => name.focus(), 0);
         }, form => {
             const name = form.elements.name.value.trim();
-            // ⚠️ Disabled fields are absent from form.elements in some browsers, so this
-            // reads through optional chaining. 臨時指令 legitimately has no instruction —
-            // refusing to save it here would make its prompt cards impossible to edit.
-            const instruction = String(form.elements.instruction?.value ?? command.instruction).trim();
-            if (!name || (!instruction && command.id !== 'one-off')) return undefined;
+            // ⚠️ Only the name is required now. A command with no 指示 card is a legal
+            // state — half-built, or deliberately parked — and the warning above says so
+            // rather than refusing to save. Refusing would trap the user in a dialog they
+            // cannot leave without deleting their work.
+            if (!name) return undefined;
             return normalizeCommand({
                 ...command,
                 name,
                 // The field is absent for builtins, which is not the same as it being blank.
                 group: readGroupFromForm(form, command.group),
                 icon: form.elements.icon.value,
-                instruction,
                 mode: form.elements.mode.value,
                 apiConfigId: form.elements.apiConfigId.value,
                 visible: form.elements.visible.checked,
@@ -5785,18 +6008,23 @@
     // The card list as a dialog, for the command form. Resolves to the edited array, or
     // null if the user backed out — so an accidental click on 編輯 does not freeze a copy
     // onto a command that was still sending the factory cards.
-    function showPromptCardsDialog(title, cards) {
+    function showPromptCardsDialog(title, cards, mode = 'patch') {
         return showSimpleForm(title, form => {
             form.append(createElement(
                 'div',
                 'stiae-help',
-                '由上往下就是送給 AI 的順序。🔒 頭尾兩個鎖住不能動：最上面那段在教 AI 用什麼格式回話，最下面那段是要編修的正文——放最後才不會讓 AI 搞混哪一段才是要改的。',
+                '由上往下就是送給 AI 的順序。點一下任何一格可以展開看它送出去的內容，鎖住的兩格也看得到；要改按右邊的鉛筆。',
+            ));
+            form.append(createElement(
+                'div',
+                'stiae-help',
+                '🔒 頭尾兩個鎖住不能動：最上面那段在教 AI 用什麼格式回話，最下面那段是要編修的正文——放最後才不會讓 AI 搞混哪一段才是要改的。',
             ));
             const list = createElement('div', 'stiae-command-list');
             const add = button('新增模組', 'fa-plus');
             // The array is mutated in place and read back on submit, so there is nothing
             // for the change callback to do here.
-            const redraw = renderPromptCardList(list, cards, () => {});
+            const redraw = renderPromptCardList(list, cards, () => {}, mode);
             add.addEventListener('click', async () => {
                 const card = await showPromptCardForm(null);
                 if (!card) return;
