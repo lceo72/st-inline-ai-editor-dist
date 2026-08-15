@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.9.1';
+    const VERSION = '0.9.2';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -95,14 +95,6 @@
     // setting nobody can predict.
     const EXTRA_BODY_RESERVED = ['model', 'messages', 'stream', 'temperature', 'max_tokens'];
 
-    // Typing aids, not knowledge. The tool never inspects what is in the box at send
-    // time — these only fill the textarea, so a provider changing its parameter is a
-    // stale example rather than a branch that silently stops working (產品決策 5).
-    const EXTRA_BODY_PRESETS = [
-        ['OpenRouter：關閉推理', { reasoning: { effort: 'none' } }],
-        ['DeepSeek：關閉推理', { thinking: { type: 'disabled' } }],
-    ];
-
     const MESSAGE_ROLE_LABELS = {
         system: '系統訊息（system）',
         user: '使用者訊息（user）',
@@ -116,7 +108,12 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.9.1
+    const CHANGELOG = `0.9.2
+- 「額外參數」拿掉了那兩顆一鍵填入的範例按鈕。那個欄位就是單純讓你加參數用的，不是「關推理」專用；而寫死在畫面上的範例遲早會過期。
+- 改成跟「API 網址」同一個做法：**空欄時用灰字示範格式**（一個平的鍵、一個巢狀的），並講明你填的鍵是加在請求的最外層。教格式而不推薦內容。
+- 關掉推理的實際寫法搬到 README。
+
+0.9.1
 - API 設定多了「額外參數」欄位：填一段 JSON，會原樣加進送出的請求裡。
 - 最常見的用途是關掉推理模型的思考（DeepSeek 之類的思考又長又貴）。各家參數名稱不一樣，所以不做成勾選框；附了 OpenRouter 與 DeepSeek 兩顆一鍵填入。
 - 直連與「改由酒館的伺服器幫忙送出」兩條路都有效，接法不同但你不用管。
@@ -162,9 +159,6 @@
 0.5.1
 - 臨時指令在同一個編輯器裡會記住剛剛打的字。
 
-0.5.0
-- 世界書條目可以勾選當參考資料，勾選會記住。
-- 參考樓層只在同一個聊天裡記住，換聊天自動清空。
 `;
 
     // ⚠️ Hard-wired, and it stays hard-wired. A configurable update source is a text box
@@ -5146,28 +5140,27 @@
             stream.checked = config.stream;
             streamLabel.append(stream, createElement('span', '', '一邊生成一邊顯示'));
 
-            // Free-form on purpose. What a provider calls its thinking switch differs per
-            // provider and moves fast — a built-in 「關閉推理」 checkbox would have to guess
-            // which parameter to send, and a stale guess reads as a switch that does
-            // nothing. The buttons below only type for you; nothing here is understood at
-            // send time.
+            // ⚠️ Free-form, and deliberately not framed around any one use. This is the
+            // escape hatch for whatever the provider accepts that this tool does not model
+            // — sampling knobs, routing hints, reasoning switches, anything. Shipping
+            // one-click examples was tried and removed in 0.9.2: they made the box look
+            // like a single-purpose button, and a baked-in example is the most prominent
+            // and least trustworthy thing in a field whose whole point is that the tool
+            // does not track what providers accept.
             const extraField = createElement('div', 'stiae-field');
             extraField.append(createElement('label', '', '額外參數（選填）'));
             const extraBody = createElement('textarea');
             extraBody.name = 'extraBody';
             extraBody.rows = 4;
             extraBody.value = formatExtraBody(config.extraBody);
-            extraBody.placeholder = '{\n  "reasoning": { "effort": "none" }\n}';
+            // Same trick the 網址 field uses: the empty state teaches the format. A flat
+            // key and a nested one, because the thing people get wrong is assuming a value
+            // has to be a single number — plenty of provider options are objects.
+            // `some_option` reads as a placeholder on purpose: this shows the shape, not a
+            // recommendation, and a real parameter name here would go stale and be read as
+            // advice (which is why the one-click examples came out in 0.9.2).
+            extraBody.placeholder = ['{', '  "top_p": 0.9,', '  "some_option": { "nested": true }', '}'].join('\n');
             const extraHint = createElement('div', 'stiae-help');
-            const extraPresets = createElement('div', 'stiae-command-row-actions');
-            for (const [label, value] of EXTRA_BODY_PRESETS) {
-                const fill = button(label, 'fa-paste');
-                fill.addEventListener('click', () => {
-                    extraBody.value = JSON.stringify(value, null, 2);
-                    extraBody.dispatchEvent(new hostWindow.Event('input', { bubbles: true }));
-                });
-                extraPresets.append(fill);
-            }
             const paintExtra = () => {
                 const parsed = parseExtraBody(extraBody.value);
                 if (!parsed.ok) {
@@ -5186,10 +5179,9 @@
             extraField.append(
                 extraBody,
                 extraHint,
-                createElement('div', 'stiae-help', '原樣加進送出的請求裡，工具不會去讀它。**留空就什麼都不加。**'.replace(/\*\*/g, '')),
-                createElement('div', 'stiae-help', '最常見的用途是**關掉推理模型的思考**——DeepSeek 之類的模型思考又長又貴，而各家的參數名稱不一樣，所以這裡不做成勾選框。下面兩顆按鈕會幫你填好；其他服務商請查它自己的文件，⚠ 要查的是它「OpenAI 相容端點」接受的參數，不是原生 API 的格式。'.replace(/\*\*/g, '')),
-                extraPresets,
-                createElement('div', 'stiae-help', '⚠ 有些模型關不掉推理（例如 Claude 的 Fable 5／Mythos 5 是常開的）。另外 OpenRouter 的 exclude 只是不回傳思考內容，模型照樣想、照樣花時間——要真的關掉是 effort: "none"。'),
+                createElement('div', 'stiae-help', '一段 JSON，會併進送出的請求的最外層——跟 model、messages 並排。值本身要幾層都可以（上面灰字就是格式示範）。'),
+                createElement('div', 'stiae-help', '工具不會去讀它的內容，也不檢查服務商認不認得——請照你的服務商文件填。留空就什麼都不加。'),
+                createElement('div', 'stiae-help', `⚠ 要查的是服務商「OpenAI 相容端點」接受的參數，不是它原生 API 的格式，那兩者常常不一樣。這裡不能設 ${EXTRA_BODY_RESERVED.join('、')}——前三個動了工具會壞掉，後兩個有自己的欄位。`),
             );
 
             form.append(
