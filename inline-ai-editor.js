@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.11.1';
+    const VERSION = '0.11.2';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -155,7 +155,10 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.11.1
+    const CHANGELOG = `0.11.2
+- **修正：工具列的資料夾與「更多」選單，在頁面忙碌時會先畫在舊位置（甚至螢幕外），要卡零點幾秒才跳到按鈕下面——看起來就像「點了沒反應」。** 現在位置在你按下去的當下就算好，選單第一次出現就在正確的地方。視窗寬度變過（例如收合瀏覽器側邊欄）再點開時最容易遇到。
+
+0.11.1
 - **局部修補模式下，模型沒照格式輸出時不再退成全文替換。** 以前模型不給 \`<search>/<replace>\` 對就把整段回覆當成全文替換候選；現在直接告訴你「模型沒有輸出指定的替換格式」，跟單條修補沒命中一樣，什麼都不會被套用。要全文改寫請用全文改寫模式的指令。
 
 0.10.1
@@ -209,11 +212,6 @@
 - 修好「更多」選單被工具列裁掉，實測只露出 4px。
 - 分組變成工具列上的資料夾按鈕，指令可以拖曳排序、拖到別組。
 - 「複製設定／貼上設定」改名為「複製設定代碼／匯入設定代碼」。
-
-0.7.0
-- 選世界書條目改成獨立視窗，搜尋框與書本選單不會被捲走。
-- 客製指令可以分組，也可以只複製指令代碼分享出去。
-- 新增「檢查更新」與「更新腳本」，按下去才連外網。
 
 `;
 
@@ -4117,6 +4115,18 @@
             });
             menu.append(item);
         });
+        // ⚠️ Positioned on click, BEFORE the toggle. The toggle event is dispatched from
+        // a queued task, but the menu becomes visible the moment the open attribute is
+        // set — so there is a window where it paints at whatever coordinates the LAST
+        // open left behind. Usually invisible; on a busy page it is not. Measured in the
+        // wild (2026-08-16, a chat whose other scripts block the main thread for 400ms+):
+        // the stale coordinates pointed off-screen because the browser window had been
+        // wider back then (Arc's sidebar collapses), so the menu opened off-screen, sat
+        // there for half a second, and the whole thing read as "the folder won't open".
+        // The click handler runs synchronously before the default action, so positioning
+        // here means the first paint is already in the right place.
+        summary.addEventListener('click', () => positionToolbarMenu(summary, menu));
+        // Kept for activations that do not come through a click (keyboard Enter/Space).
         details.addEventListener('toggle', () => {
             if (details.open) positionToolbarMenu(summary, menu);
         });
