@@ -41,7 +41,7 @@
 
     // ══════ 常數與輸出協定 ══════
 
-    const VERSION = '0.10.1';
+    const VERSION = '0.11.1';
     const SETTINGS_KEY = 'st_inline_ai_editor';
     const INSTANCE_KEY = '__ST_INLINE_AI_EDITOR_INSTANCE__';
     const STYLE_ID = 'stiae-styles';
@@ -155,7 +155,10 @@
     //
     // Only the last ten releases live here. This string ships inside every copy of the
     // script and an unbounded one would grow the file forever.
-    const CHANGELOG = `0.10.1
+    const CHANGELOG = `0.11.1
+- **局部修補模式下，模型沒照格式輸出時不再退成全文替換。** 以前模型不給 \`<search>/<replace>\` 對就把整段回覆當成全文替換候選；現在直接告訴你「模型沒有輸出指定的替換格式」，跟單條修補沒命中一樣，什麼都不會被套用。要全文改寫請用全文改寫模式的指令。
+
+0.10.1
 - **「指示」不再是一個獨立的輸入框，它就是一張普通的模組。** 指令表單裡那一格沒了；要寫「請 AI 做什麼」，就在這條指令的模組清單裡寫一張——出廠已經幫你放好一張叫「指示」的，標籤填 \`task\`。
 - 它跟其他模組沒有任何差別：可改、可關、可刪、可拖，也可以放好幾張。**沒有另外的開關要勾**——標籤 \`task\` 已經對 AI 說了這是任務。
 - **模組清單可以點開看內容了**，鎖住的協定與目標內文也看得到。要改仍然是按右邊的鉛筆。
@@ -211,10 +214,6 @@
 - 選世界書條目改成獨立視窗，搜尋框與書本選單不會被捲走。
 - 客製指令可以分組，也可以只複製指令代碼分享出去。
 - 新增「檢查更新」與「更新腳本」，按下去才連外網。
-
-0.6.1
-- 魔杖從 ⋯ 選單拉到樓層動作列上，少按一次。
-- 修正窄螢幕上「查看整個樓層的修改位置」排版錯亂。
 
 `;
 
@@ -1277,47 +1276,44 @@
 
         if (requestedMode === 'patch') {
             const pairs = parseSearchReplacePairs(raw);
-            if (pairs.length) {
-                const searchTagCount = (raw.match(/<search>/gi) || []).length;
-                const replaceTagCount = (raw.match(/<replace>/gi) || []).length;
-                const malformedCount = Math.max(searchTagCount, replaceTagCount) - pairs.length;
-                const result = applySearchReplacePairs(scopeText, pairs);
-                if (malformedCount > 0) {
-                    warnings.push(`有 ${malformedCount} 項修補格式不完整，已跳過。`);
-                }
-                if (result.skipped.length) {
-                    warnings.push(`有 ${result.skipped.length} 項修補找不到原文，已跳過。`);
-                    // A free diagnostic lead rather than an up-front warning: there is
-                    // no evidence that reference material raises the miss rate, and a
-                    // permanent "this might fail" notice would just become noise. Once
-                    // something has actually missed, saying where to look is cheap.
-                    if (hasReference) {
-                        warnings.push('這次帶了參考資料，模型可能是從參考資料裡取原文。');
-                    }
-                    // Name the text that missed, so a near-miss (a quotation mark the
-                    // model balanced, a character it normalised) is visible instead of
-                    // hiding behind a count.
-                    for (const pair of result.skipped.slice(0, SKIPPED_PREVIEW_LIMIT)) {
-                        warnings.push(`找不到這段：${previewText(pair.search)}`);
-                    }
-                }
-                return {
-                    kind: 'patch',
-                    text: result.text,
-                    raw,
-                    appliedCount: result.applied.length,
-                    skippedCount: result.skipped.length,
-                    warnings,
-                };
+            const searchTagCount = (raw.match(/<search>/gi) || []).length;
+            const replaceTagCount = (raw.match(/<replace>/gi) || []).length;
+            const malformedCount = Math.max(searchTagCount, replaceTagCount) - pairs.length;
+            const result = applySearchReplacePairs(scopeText, pairs);
+            if (malformedCount > 0) {
+                warnings.push(`有 ${malformedCount} 項修補格式不完整，已跳過。`);
             }
-
-            warnings.push('模型未遵守局部修補格式，已改用全文替換預覽。');
+            // ⚠️ No pairs is NOT a fallback to full replacement any more (owner's call,
+            // 0.11.1). A patch command promised local edits; handing the whole reply
+            // over as a replacement candidate turns "the model ignored the format"
+            // into "the whole message gets swapped", which is a bigger surprise than
+            // the failure it papers over. Treated like a miss instead: nothing is
+            // applied, the dialog says why, and 重新生成 is the way forward.
+            if (!pairs.length && malformedCount === 0) {
+                warnings.push('模型沒有輸出指定的替換格式，沒有任何修補可以套用。');
+            }
+            if (result.skipped.length) {
+                warnings.push(`有 ${result.skipped.length} 項修補找不到原文，已跳過。`);
+                // A free diagnostic lead rather than an up-front warning: there is
+                // no evidence that reference material raises the miss rate, and a
+                // permanent "this might fail" notice would just become noise. Once
+                // something has actually missed, saying where to look is cheap.
+                if (hasReference) {
+                    warnings.push('這次帶了參考資料，模型可能是從參考資料裡取原文。');
+                }
+                // Name the text that missed, so a near-miss (a quotation mark the
+                // model balanced, a character it normalised) is visible instead of
+                // hiding behind a count.
+                for (const pair of result.skipped.slice(0, SKIPPED_PREVIEW_LIMIT)) {
+                    warnings.push(`找不到這段：${previewText(pair.search)}`);
+                }
+            }
             return {
-                kind: 'fallback-replacement',
-                text: raw,
+                kind: 'patch',
+                text: result.text,
                 raw,
-                appliedCount: 0,
-                skippedCount: 0,
+                appliedCount: result.applied.length,
+                skippedCount: result.skipped.length,
                 warnings,
             };
         }
